@@ -1874,7 +1874,6 @@ class TelegramBot:
         
         return text
 
-    def _process_update(self, update: Dict): ...
     def _rate_limit_ok(self, user_id: int) -> bool: ...
 
     def get_updates(self, timeout: int = 25) -> List[Dict]:
@@ -2025,11 +2024,23 @@ class TelegramBot:
 
     # ===== UPDATE PROCESSING =====
     
+
+
     def _process_update(self, update: Dict):
-        """Process update with comprehensive error handling."""
+        """
+        Process update with proper routing for entry wizard input.
+        """
         try:
             # Handle callback queries
             if "callback_query" in update:
+                callback_data = update["callback_query"].get("data", "")
+                
+                # Route entry callbacks to entry handler
+                if callback_data.startswith("entry_"):
+                    self.entry_handler.handle_callback(update["callback_query"])
+                    return
+                
+                # Handle other callbacks
                 self._handle_callback_safe(update["callback_query"])
                 return
             
@@ -2045,6 +2056,15 @@ class TelegramBot:
             chat_id = message["chat"]["id"]
             user_id = message["from"]["id"]
             
+            # IMPORTANT: Check for entry session BEFORE command processing
+            # This allows number input to work during entry
+            if hasattr(self, 'entry_handler') and user_id in self.entry_handler.sessions:
+                session = self.entry_handler.sessions[user_id]
+                if not session.is_expired():
+                    # Let entry handler process the text (including numbers)
+                    self.entry_handler.handle_text_input(message, session)
+                    return
+            
             # Handle commands
             if text.startswith("/"):
                 command = text.split()[0].lower()
@@ -2059,14 +2079,14 @@ class TelegramBot:
                 self._route_command(message, command)
                 return
             
-            # Handle conversation input
+            # Handle old-style conversation input (if still in use)
             with self.conversation_lock:
                 if user_id in self.conversations:
                     state = self.conversations[user_id]
                     self._handle_conversation_input_safe(message, state)
                     return
             
-            # No active conversation
+            # No active session or conversation
             self.send_message(chat_id, 
                             "Type /help to see available commands or /entry to start.")
             
@@ -2079,7 +2099,7 @@ class TelegramBot:
                                     "⚠️ An error occurred. Please try again.")
             except:
                 pass
-    
+
     def _route_command(self, message: Dict, command: str):
         """Route commands to appropriate handlers."""
         handlers = {
@@ -3627,32 +3647,33 @@ class EnhancedEntryHandler:
             self._handle_submit(chat_id, user_id)
         elif data == "entry_resume_items":
             self._resume_items(chat_id, user_id)
-    
+
     def handle_text_input(self, message: Dict, session: EntrySession):
-        """Handle text input for quantity entry."""
+        """
+        Handle text input for quantity entry - FIXED to accept numbers.
+        """
         text = message.get("text", "").strip()
         chat_id = session.chat_id
         
         # Update session activity
         session.update_activity()
         
-        # Validate input
+        # Check for special text commands first
+        if text.lower() in ["/back", "back"]:
+            self._handle_back(chat_id, session.user_id)
+            return
+        elif text.lower() in ["/skip", "skip"]:
+            self._handle_skip(chat_id, session.user_id)
+            return
+        elif text.lower() in ["/done", "done"]:
+            self._handle_done(chat_id, session.user_id)
+            return
+        elif text.lower() in ["/cancel", "cancel"]:
+            self._handle_cancel(chat_id, session.user_id)
+            return
+        
+        # Try to parse as number
         try:
-            # Check for special text commands
-            if text.lower() in ["/back", "back"]:
-                self._handle_back(chat_id, session.user_id)
-                return
-            elif text.lower() in ["/skip", "skip"]:
-                self._handle_skip(chat_id, session.user_id)
-                return
-            elif text.lower() in ["/done", "done"]:
-                self._handle_done(chat_id, session.user_id)
-                return
-            elif text.lower() in ["/cancel", "cancel"]:
-                self._handle_cancel(chat_id, session.user_id)
-                return
-            
-            # Parse as number
             quantity = float(text)
             
             # Validate range
@@ -3676,6 +3697,11 @@ class EnhancedEntryHandler:
             session.set_current_quantity(quantity)
             session.index += 1
             
+            # Log the entry
+            item = session.items[session.index - 1] if session.index > 0 else None
+            if item:
+                self.logger.info(f"Entry: {item['name']} = {quantity}")
+            
             # Show next item or complete
             if session.index >= len(session.items):
                 self._handle_done(chat_id, session.user_id)
@@ -3683,10 +3709,11 @@ class EnhancedEntryHandler:
                 self._show_current_item(session)
                 
         except ValueError:
+            # Not a valid number
             self.bot.send_message(
                 chat_id,
-                "❌ Please enter a valid number (e.g., 0, 1.5, 2)\n"
-                "Or use: back, skip, done, cancel"
+                "❌ Please enter a valid number (e.g., 0, 1, 1.5, 2)\n"
+                "Or use the buttons: Skip, Done, Cancel"
             )
             self._show_current_item(session)
     

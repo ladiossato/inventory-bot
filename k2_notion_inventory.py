@@ -3097,12 +3097,12 @@ class TelegramBot:
             self.logger.error(f"/order failed: {e}", exc_info=True)
             self.send_message(chat_id, "⚠️ Unable to generate orders. Please try again.")
 
-
     def _handle_order_avondale(self, message: Dict):
         """
-        Avondale-specific order with clean format and team message.
+        Avondale order with header info and clean request-style list.
         """
         import math
+        from datetime import datetime
         chat_id = message["chat"]["id"]
         
         try:
@@ -3134,14 +3134,14 @@ class TelegramBot:
             
             orders.sort(key=lambda x: x['qty'], reverse=True)
             
-            # Build message
+            # Build message header
             text = (
                 "🏪 <b>AVONDALE PURCHASE ORDER</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📅 Delivery Date: <b>{delivery}</b>\n"
+                f"📅 Delivery Date: {delivery}\n"
             )
             
-            # Show order timing if available
+            # Show order timing
             if cycle:
                 days_pre = cycle.get('days_pre', 0)
                 days_post = cycle.get('days_post', 0)
@@ -3151,43 +3151,56 @@ class TelegramBot:
                     f"  • Coverage days: {days_post}\n"
                 )
             
-            text += f"📦 Items to Order: <b>{len(orders)}</b>\n\n"
+            text += f"📦 Items to Order: {len(orders)}\n\n"
             
             if orders:
-                # Summary by unit type
+                # Order summary by unit type
                 text += "📊 <b>Order Summary</b>\n"
                 for unit, total in sorted(totals.items(), key=lambda x: (-x[1], x[0])):
                     text += f"  • {total} {unit}{'s' if total > 1 else ''}\n"
                 
-                text += "\n📋 <b>Detailed Order List</b>\n"
-                text += "─" * 28 + "\n"
+                # Request-style message format
+                text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                text += f"📋 <b>ORDER REQUEST - AVONDALE</b>\n"
                 
-                for item in orders:
-                    # Clean format without checkbox
-                    text += f"{item['qty']} {item['unit']} — {item['name']}\n"
-                    
-                    # Show stock forecast details
-                    burn_down = item['current'] - item['oh_delivery']
-                    if burn_down > 0.1:
-                        text += (
-                            f"  Stock: {item['current']:.1f} → "
-                            f"{item['oh_delivery']:.1f} (burn {burn_down:.1f})\n"
-                        )
-                    else:
-                        text += f"  Stock: {item['current']:.1f}\n"
-                    text += f"  Need: {item['need']:.1f} for {cycle.get('days_post', 0)} days\n"
+                # Get current day
+                now = get_time_in_timezone(BUSINESS_TIMEZONE)
+                text += f"📅 {now.strftime('%a %b %d, %Y')}\n\n"
                 
-                # Team message
-                totals_summary = " • ".join(f"{v} {k}" for k, v in sorted(totals.items()))
+                # Delivery day from date
+                try:
+                    delivery_date = datetime.strptime(delivery, '%Y-%m-%d')
+                    delivery_day = delivery_date.strftime('%A')
+                except:
+                    delivery_day = "delivery"
                 
                 text += (
-                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "📱 <b>Team Message:</b>\n"
-                    f"<i>Please order {totals_summary} for {delivery} delivery. "
-                    f"This covers {cycle.get('days_post', 0)} days after delivery.</i>\n\n"
-                    "✅ Ready to send to supplier\n"
-                    "💡 Accounts for {days_pre} day burn-down"
-                ).format(days_pre=cycle.get('days_pre', 0))
+                    f"Hey Avondale Prep Team! This is what we need for {delivery_day} Delivery.\n"
+                    f"Please confirm at your earliest convenience:\n\n"
+                )
+                
+                # Clean item list
+                for item in orders:
+                    # Format: • Item Name: X units
+                    plural = 's' if item['qty'] > 1 else ''
+                    # Handle unit pluralization properly
+                    if item['unit'] == 'case':
+                        unit_plural = 'cases' if item['qty'] > 1 else 'case'
+                    elif item['unit'] == 'bag':
+                        unit_plural = 'bags' if item['qty'] > 1 else 'bag'
+                    elif item['unit'] == 'tray':
+                        unit_plural = 'trays' if item['qty'] > 1 else 'tray'
+                    elif item['unit'] == 'bottle':
+                        unit_plural = 'bottles' if item['qty'] > 1 else 'bottle'
+                    elif item['unit'] == 'quart':
+                        unit_plural = 'quarts' if item['qty'] > 1 else 'quart'
+                    else:
+                        unit_plural = item['unit'] + plural
+                    
+                    text += f"• {item['name']}: {item['qty']} {unit_plural}\n"
+                
+                text += f"\nTotal items: {len(orders)}"
+                
             else:
                 text += (
                     "✅ <b>No Orders Needed</b>\n\n"
@@ -3205,9 +3218,10 @@ class TelegramBot:
 
     def _handle_order_commissary(self, message: Dict):
         """
-        Commissary-specific order with clean format and team message.
+        Commissary order with header info and clean request-style list.
         """
         import math
+        from datetime import datetime
         chat_id = message["chat"]["id"]
         
         try:
@@ -3239,14 +3253,14 @@ class TelegramBot:
             
             orders.sort(key=lambda x: x['qty'], reverse=True)
             
-            # Build message
+            # Build message header
             text = (
                 "🏭 <b>COMMISSARY PURCHASE ORDER</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📅 Delivery Date: <b>{delivery}</b>\n"
+                f"📅 Delivery Date: {delivery}\n"
             )
             
-            # Show order timing if available
+            # Show order timing
             if cycle:
                 days_pre = cycle.get('days_pre', 0)
                 days_post = cycle.get('days_post', 0)
@@ -3256,43 +3270,56 @@ class TelegramBot:
                     f"  • Coverage days: {days_post}\n"
                 )
             
-            text += f"📦 Items to Order: <b>{len(orders)}</b>\n\n"
+            text += f"📦 Items to Order: {len(orders)}\n\n"
             
             if orders:
-                # Summary by unit type
+                # Order summary by unit type
                 text += "📊 <b>Order Summary</b>\n"
                 for unit, total in sorted(totals.items(), key=lambda x: (-x[1], x[0])):
                     text += f"  • {total} {unit}{'s' if total > 1 else ''}\n"
                 
-                text += "\n📋 <b>Detailed Order List</b>\n"
-                text += "─" * 28 + "\n"
+                # Request-style message format
+                text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                text += f"📋 <b>ORDER REQUEST - COMMISSARY</b>\n"
                 
-                for item in orders:
-                    # Clean format without checkbox
-                    text += f"{item['qty']} {item['unit']} — {item['name']}\n"
-                    
-                    # Show stock forecast details
-                    burn_down = item['current'] - item['oh_delivery']
-                    if burn_down > 0.1:
-                        text += (
-                            f"  Stock: {item['current']:.1f} → "
-                            f"{item['oh_delivery']:.1f} (burn {burn_down:.1f})\n"
-                        )
-                    else:
-                        text += f"  Stock: {item['current']:.1f}\n"
-                    text += f"  Need: {item['need']:.1f} for {cycle.get('days_post', 0)} days\n"
+                # Get current day
+                now = get_time_in_timezone(BUSINESS_TIMEZONE)
+                text += f"📅 {now.strftime('%a %b %d, %Y')}\n\n"
                 
-                # Team message
-                totals_summary = " • ".join(f"{v} {k}" for k, v in sorted(totals.items()))
+                # Delivery day from date
+                try:
+                    delivery_date = datetime.strptime(delivery, '%Y-%m-%d')
+                    delivery_day = delivery_date.strftime('%A')
+                except:
+                    delivery_day = "delivery"
                 
                 text += (
-                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "📱 <b>Team Message:</b>\n"
-                    f"<i>Please order {totals_summary} for {delivery} delivery. "
-                    f"This covers {cycle.get('days_post', 0)} days after delivery.</i>\n\n"
-                    "✅ Ready to send to supplier\n"
-                    "💡 Accounts for {days_pre} day burn-down"
-                ).format(days_pre=cycle.get('days_pre', 0))
+                    f"Hey Commissary Prep Team! This is what we need for {delivery_day} Delivery.\n"
+                    f"Please confirm at your earliest convenience:\n\n"
+                )
+                
+                # Clean item list
+                for item in orders:
+                    # Format: • Item Name: X units
+                    plural = 's' if item['qty'] > 1 else ''
+                    # Handle unit pluralization properly
+                    if item['unit'] == 'case':
+                        unit_plural = 'cases' if item['qty'] > 1 else 'case'
+                    elif item['unit'] == 'bag':
+                        unit_plural = 'bags' if item['qty'] > 1 else 'bag'
+                    elif item['unit'] == 'tray':
+                        unit_plural = 'trays' if item['qty'] > 1 else 'tray'
+                    elif item['unit'] == 'bottle':
+                        unit_plural = 'bottles' if item['qty'] > 1 else 'bottle'
+                    elif item['unit'] == 'quart':
+                        unit_plural = 'quarts' if item['qty'] > 1 else 'quart'
+                    else:
+                        unit_plural = item['unit'] + plural
+                    
+                    text += f"• {item['name']}: {item['qty']} {unit_plural}\n"
+                
+                text += f"\nTotal items: {len(orders)}"
+                
             else:
                 text += (
                     "✅ <b>No Orders Needed</b>\n\n"
@@ -3306,8 +3333,7 @@ class TelegramBot:
         except Exception as e:
             self.logger.error(f"/order_commissary failed: {e}", exc_info=True)
             self.send_message(chat_id, "⚠️ Unable to generate Commissary order. Please try again.")
-
-
+ 
     def _handle_reassurance(self, message: Dict):
         """
         Daily risk assessment with FIXED consumption math.

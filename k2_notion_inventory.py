@@ -1233,105 +1233,139 @@ class NotionManager:
 
 class InventoryCalculator:
     """
-    Core business logic engine for inventory calculations, status determination,
-    and auto-request generation. Uses Notion data with location-aware calculations
-    and proper delivery schedule integration.
+    Core business logic engine with FIXED consumption math.
+    Now correctly forecasts on-hand at delivery and sizes orders for post-delivery window.
     """
     
-    def __init__(self, notion_manager: NotionManager):
-        """
-        Initialize calculator with Notion manager dependency.
-        
-        Args:
-            notion_manager: Notion manager instance
-        """
+    def __init__(self, notion_manager):
+        """Initialize calculator with Notion manager dependency."""
         self.notion = notion_manager
         self.logger = logging.getLogger('calculations')
-        self.logger.info("Inventory calculator initialized with Notion integration")
+        self.logger.info("Inventory calculator initialized with FIXED consumption math")
+        
+        # Delivery schedules with full business days counting
+        self.delivery_cycles = {
+            "Avondale": {
+                # Cycle A: Order Tuesday → Deliver Thursday → Next Monday
+                "Tuesday": {"days_pre": 2, "days_post": 3, "delivery_day": "Thursday"},
+                # Cycle B: Order Saturday → Deliver Monday → Next Thursday  
+                "Saturday": {"days_pre": 2, "days_post": 2, "delivery_day": "Monday"}
+            },
+            "Commissary": {
+                # Cycle C1: Order Monday → Deliver Tuesday → Next Thursday
+                "Monday": {"days_pre": 1, "days_post": 1, "delivery_day": "Tuesday"},
+                # Cycle C2: Order Wednesday → Deliver Thursday → Next Saturday
+                "Wednesday": {"days_pre": 1, "days_post": 1, "delivery_day": "Thursday"},
+                # Cycle C3: Order Friday → Deliver Saturday → Next Tuesday
+                "Friday": {"days_pre": 1, "days_post": 2, "delivery_day": "Saturday"}
+            }
+        }
     
-    def calculate_days_until_next_delivery(self, location: str, from_date: datetime = None) -> Tuple[float, str]:
+    def get_current_order_cycle(self, location: str, from_date: datetime = None) -> Dict[str, Any]:
         """
-        Calculate days until next scheduled delivery for a location.
+        Determine which order cycle we're in based on location and current day.
         
-        Note: Delivery schedules are calculated in business timezone (America/Chicago)
-        regardless of user's local timezone, since deliveries happen at physical locations.
-        
-        Args:
-            location: Location name ('Avondale' or 'Commissary')
-            from_date: Calculate from this date (defaults to current time in business timezone)
-            
         Returns:
-            Tuple[float, str]: (days_until_delivery, delivery_date_string)
+            Dict with days_pre, days_post, delivery_day
         """
         if from_date is None:
-            # Use business timezone for delivery calculations
             from_date = get_time_in_timezone(BUSINESS_TIMEZONE)
         
-        schedule = DELIVERY_SCHEDULES[location]
-        delivery_days = schedule["days"]
-        delivery_hour = schedule["hour"]
+        weekday_name = from_date.strftime("%A")
         
-        self.logger.debug(f"Calculating next delivery for {location} from {from_date} (business timezone)")
+        # Find the appropriate cycle
+        cycles = self.delivery_cycles.get(location, {})
         
-        # Find next delivery day
-        current_weekday = from_date.weekday()  # 0=Monday, 6=Sunday
-        weekday_map = {
-            'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3,
-            'Friday': 4, 'Saturday': 5, 'Sunday': 6
-        }
+        # Check if today is an order day
+        if weekday_name in cycles:
+            return cycles[weekday_name]
         
-        delivery_weekdays = [weekday_map[day] for day in delivery_days]
+        # Find the next order day
+        days_ahead = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        current_idx = days_ahead.index(weekday_name)
         
-        days_ahead = []
-        for delivery_weekday in delivery_weekdays:
-            if delivery_weekday > current_weekday:
-                # This week
-                days_ahead.append(delivery_weekday - current_weekday)
-            elif delivery_weekday == current_weekday:
-                # Today - check if delivery time has passed
-                current_hour = from_date.hour
-                if current_hour < delivery_hour:
-                    # Delivery is later today
-                    days_ahead.append(0)
-                else:
-                    # Delivery already passed, next week
-                    days_ahead.append(7)
-            else:
-                # Next week
-                days_ahead.append(7 - current_weekday + delivery_weekday)
+        for i in range(1, 8):
+            next_day = days_ahead[(current_idx + i) % 7]
+            if next_day in cycles:
+                return cycles[next_day]
         
-        # Find the soonest delivery
-        days_until = min(days_ahead)
-        
-        # Calculate exact time until delivery including hour
-        next_delivery = from_date + timedelta(days=days_until)
-        next_delivery = next_delivery.replace(hour=delivery_hour, minute=0, second=0, microsecond=0)
-        
-        # If delivery is today but after current time, calculate fractional days
-        if days_until == 0:
-            time_diff = next_delivery - from_date
-            days_until = time_diff.total_seconds() / (24 * 3600)
-        
-        delivery_date_str = next_delivery.strftime('%Y-%m-%d')
-        
-        self.logger.debug(f"Next delivery for {location}: {days_until:.2f} days on {delivery_date_str}")
-        return days_until, delivery_date_str
+        # Default fallback (should never reach here)
+        return {"days_pre": 2, "days_post": 3, "delivery_day": "Thursday"}
     
-    def calculate_item_status(self, item: InventoryItem, current_qty: float = None,
-                            from_date: datetime = None) -> Dict[str, Any]:
+    def forecast_on_hand_at_delivery(self, oh_now: float, adu: float, days_pre: int) -> float:
         """
-        Calculate comprehensive status using sophisticated consumption analysis.
+        Forecast on-hand quantity at delivery time.
         
-        Implements delivery-cycle-aware calculations that account for varying
-        consumption periods between different delivery days.
+        Core formula: OH_at_delivery = max(0, OH_now - ADU × Days_pre)
         
         Args:
-            item: Inventory item with consumption logic
-            current_qty: Current quantity (if None, gets from Notion)
-            from_date: Calculate from this date (defaults to now)
+            oh_now: Current on-hand quantity
+            adu: Average daily usage
+            days_pre: Full business days until delivery
             
         Returns:
-            Dict containing comprehensive status analysis
+            float: Forecasted on-hand at delivery
+        """
+        consumption_before_delivery = adu * days_pre
+        oh_at_delivery = max(0, oh_now - consumption_before_delivery)
+        
+        self.logger.debug(f"Forecast: OH_now={oh_now:.1f} - (ADU={adu:.2f} × days_pre={days_pre}) = {oh_at_delivery:.1f}")
+        return oh_at_delivery
+    
+    def compute_order_quantity(self, oh_now: float, adu: float, days_pre: int, 
+                              days_post: int, safety_days: float = 0) -> float:
+        """
+        Compute order quantity using FIXED consumption math.
+        
+        Core formulas:
+        - OH_at_delivery = max(0, OH_now - ADU × Days_pre)  
+        - Need_post = ADU × (Days_post + Safety_days)
+        - Order_raw = max(0, Need_post - OH_at_delivery)
+        
+        Args:
+            oh_now: Current on-hand quantity
+            adu: Average daily usage
+            days_pre: Full business days until delivery
+            days_post: Full business days from delivery to next delivery
+            safety_days: Optional buffer days
+            
+        Returns:
+            float: Raw order quantity (before rounding)
+        """
+        # Forecast what we'll have when truck arrives
+        oh_at_delivery = self.forecast_on_hand_at_delivery(oh_now, adu, days_pre)
+        
+        # Calculate need for post-delivery window
+        need_post = adu * (days_post + safety_days)
+        
+        # Calculate raw order
+        order_raw = max(0, need_post - oh_at_delivery)
+        
+        self.logger.debug(
+            f"Order calc: need_post={need_post:.1f} - oh_at_delivery={oh_at_delivery:.1f} = {order_raw:.1f}"
+        )
+        
+        return order_raw
+    
+    def round_to_pack(self, quantity: float, unit_type: str) -> int:
+        """
+        Round up to purchasable unit.
+        
+        Args:
+            quantity: Raw quantity
+            unit_type: Unit type (case, bag, bottle, etc.)
+            
+        Returns:
+            int: Rounded quantity for ordering
+        """
+        if quantity <= 0:
+            return 0
+        return math.ceil(quantity)
+    
+    def calculate_item_status(self, item: Any, current_qty: float = None,
+                            from_date: datetime = None) -> Dict[str, Any]:
+        """
+        Calculate item status with FIXED consumption math.
         """
         start_time = time.time()
         
@@ -1341,30 +1375,30 @@ class InventoryCalculator:
         # Get current quantity if not provided
         if current_qty is None:
             inventory_data = self.notion.get_latest_inventory(item.location)
-            # FIX: Handle simple float return instead of tuple
             current_qty = inventory_data.get(item.name, 0.0)
-            last_count_date = from_date.strftime('%Y-%m-%d')
-        else:
-            last_count_date = from_date.strftime('%Y-%m-%d')
         
-        # Calculate consumption need using sophisticated cycle analysis
-        consumption_need = item.calculate_consumption_need(from_date)
-        current_consumption_days = item.get_current_consumption_days(from_date)
+        # Get order cycle parameters
+        cycle = self.get_current_order_cycle(item.location, from_date)
+        days_pre = cycle["days_pre"]
+        days_post = cycle["days_post"]
         
-        # Calculate required order quantity
-        required_order = max(0, consumption_need - current_qty)
+        # Calculate using FIXED formulas
+        oh_at_delivery = self.forecast_on_hand_at_delivery(current_qty, item.adu, days_pre)
+        need_post = item.adu * days_post
+        order_raw = self.compute_order_quantity(current_qty, item.adu, days_pre, days_post)
+        order_final = self.round_to_pack(order_raw, item.unit_type)
         
-        # Determine status using business-critical logic
-        status = item.determine_status(current_qty, consumption_need)
+        # Determine status based on whether we need to order
+        status = 'RED' if order_final > 0 else 'GREEN'
         
-        # Calculate advanced analytics
+        # Calculate days of stock remaining
         days_of_stock = (current_qty / item.adu) if item.adu > 0 else float('inf')
         
         # Risk assessment
-        coverage_ratio = current_qty / consumption_need if consumption_need > 0 else float('inf')
-        risk_level = 'HIGH' if coverage_ratio < 0.8 else 'MEDIUM' if coverage_ratio < 1.2 else 'LOW'
+        coverage_ratio = oh_at_delivery / need_post if need_post > 0 else float('inf')
+        risk_level = 'HIGH' if coverage_ratio < 0.5 else 'MEDIUM' if coverage_ratio < 1.0 else 'LOW'
         
-        # Get next delivery info for context
+        # Get delivery info
         days_until_delivery, delivery_date = self.calculate_days_until_next_delivery(item.location, from_date)
         
         result = {
@@ -1373,13 +1407,15 @@ class InventoryCalculator:
             'location': item.location,
             'unit_type': item.unit_type,
             'adu': item.adu,
-            'current_consumption_days': current_consumption_days,
             'current_qty': current_qty,
-            'last_count_date': last_count_date,
+            'oh_at_delivery': oh_at_delivery,
+            'days_pre': days_pre,
+            'days_post': days_post,
             'days_until_delivery': days_until_delivery,
             'delivery_date': delivery_date,
-            'consumption_need': consumption_need,
-            'required_order': required_order,
+            'consumption_need': need_post,  # This is Need_post
+            'required_order': order_raw,
+            'required_order_rounded': order_final,
             'status': status,
             'days_of_stock': days_of_stock,
             'coverage_ratio': coverage_ratio,
@@ -1388,58 +1424,63 @@ class InventoryCalculator:
         }
         
         duration_ms = (time.time() - start_time) * 1000
-        self.logger.debug(f"Advanced status calculated for {item.name} in {duration_ms:.2f}ms: "
-                        f"qty={current_qty}, need={consumption_need:.1f}, status={status}, risk={risk_level}")
+        self.logger.info(
+            f"[FIXED MATH] {item.name}: OH_now={current_qty:.1f}, Days_pre={days_pre}, "
+            f"Days_post={days_post}, OH_delivery={oh_at_delivery:.1f}, "
+            f"Need_post={need_post:.1f}, Order={order_final}"
+        )
         
         return result
-
-
+    
     def calculate_location_summary(self, location: str, from_date: datetime = None) -> Dict[str, Any]:
         """
-        Calculate comprehensive summary for all items in a location.
-        
-        Args:
-            location: Location name
-            from_date: Calculate from this date (defaults to now)
-            
-        Returns:
-            Dict containing location summary with all item statuses
+        Calculate summary with FIXED consumption math for all items.
         """
         start_time = time.time()
         
         if from_date is None:
             from_date = get_time_in_timezone(BUSINESS_TIMEZONE)
         
+        # Get order cycle info
+        cycle = self.get_current_order_cycle(location, from_date)
+        
+        # Log cycle info for debugging
+        self.logger.info(
+            f"[ORDER CYCLE] {location} on {from_date.strftime('%A')}: "
+            f"Days_pre={cycle['days_pre']}, Days_post={cycle['days_post']}, "
+            f"Delivery={cycle['delivery_day']}"
+        )
+        
         # Get all items for location
         items = self.notion.get_items_for_location(location)
         
-        # Get all current inventory quantities
+        # Get current inventory
         inventory_data = self.notion.get_latest_inventory(location)
         
         # Calculate status for each item
         item_statuses = []
-        status_counts = {'RED': 0, 'GREEN': 0}  # Only RED and GREEN now
+        status_counts = {'RED': 0, 'GREEN': 0}
         total_required_order = 0
         critical_items = []
         
         for item in items:
-            # FIX: Handle simple float return instead of tuple
             current_qty = inventory_data.get(item.name, 0.0)
             status_info = self.calculate_item_status(item, current_qty, from_date)
             
             item_statuses.append(status_info)
             status_counts[status_info['status']] += 1
-            total_required_order += status_info['required_order']
+            total_required_order += status_info['required_order_rounded']
             
             if status_info['status'] == 'RED':
                 critical_items.append(status_info['item_name'])
         
-        # Calculate next delivery info
+        # Get delivery info
         days_until_delivery, delivery_date = self.calculate_days_until_next_delivery(location, from_date)
         
         summary = {
             'location': location,
             'calculation_date': from_date.isoformat(),
+            'order_cycle': cycle,
             'total_items': len(items),
             'days_until_delivery': days_until_delivery,
             'delivery_date': delivery_date,
@@ -1450,28 +1491,24 @@ class InventoryCalculator:
         }
         
         duration_ms = (time.time() - start_time) * 1000
-        self.logger.info(f"Location summary calculated for {location} in {duration_ms:.2f}ms: "
-                        f"{status_counts['RED']} RED, {status_counts['GREEN']} GREEN")
+        self.logger.info(
+            f"[SUMMARY] {location} calculated in {duration_ms:.2f}ms: "
+            f"{status_counts['RED']} RED, {status_counts['GREEN']} GREEN, "
+            f"Total order: {total_required_order} units"
+        )
         
         return summary
     
     def generate_auto_requests(self, location: str, from_date: datetime = None) -> Dict[str, Any]:
         """
-        Generate automated purchase requests for a location based on current inventory.
-        
-        Args:
-            location: Location name
-            from_date: Generate from this date (defaults to now)
-            
-        Returns:
-            Dict containing request summary and individual item requests
+        Generate purchase orders with FIXED consumption math.
         """
         start_time = time.time()
         
         if from_date is None:
             from_date = get_time_in_timezone(BUSINESS_TIMEZONE)
         
-        # Get location summary with current calculations
+        # Get location summary
         summary = self.calculate_location_summary(location, from_date)
         
         # Generate requests for items that need ordering
@@ -1479,24 +1516,28 @@ class InventoryCalculator:
         total_items_requested = 0
         
         for item_status in summary['items']:
-            if item_status['required_order'] > 0:
+            if item_status['required_order_rounded'] > 0:
                 request = {
                     'item_id': item_status['item_id'],
                     'item_name': item_status['item_name'],
                     'unit_type': item_status['unit_type'],
                     'current_qty': item_status['current_qty'],
-                    'consumption_need': item_status['consumption_need'],
-                    'requested_qty': item_status['required_order'],
+                    'oh_at_delivery': item_status['oh_at_delivery'],
+                    'consumption_need': item_status['consumption_need'],  # Need_post
+                    'requested_qty': item_status['required_order_rounded'],
                     'status': item_status['status'],
-                    'delivery_date': item_status['delivery_date']
+                    'delivery_date': item_status['delivery_date'],
+                    'days_pre': item_status['days_pre'],
+                    'days_post': item_status['days_post']
                 }
                 
                 requests.append(request)
-                total_items_requested += item_status['required_order']
+                total_items_requested += item_status['required_order_rounded']
         
         request_summary = {
             'location': location,
             'request_date': from_date.strftime('%Y-%m-%d'),
+            'order_cycle': summary['order_cycle'],
             'delivery_date': summary['delivery_date'],
             'total_items': len(requests),
             'total_quantity': total_items_requested,
@@ -1505,13 +1546,101 @@ class InventoryCalculator:
         }
         
         duration_ms = (time.time() - start_time) * 1000
-        self.logger.info(f"Auto-requests generated for {location} in {duration_ms:.2f}ms: "
-                        f"{len(requests)} items, {total_items_requested} total units")
+        self.logger.info(
+            f"[AUTO-REQUEST] {location} generated in {duration_ms:.2f}ms: "
+            f"{len(requests)} items, {total_items_requested} total units"
+        )
         
         return request_summary
+    
+    def calculate_days_until_next_delivery(self, location: str, from_date: datetime = None) -> Tuple[float, str]:
+        """
+        Calculate days until next scheduled delivery.
+        
+        Args:
+            location: Location name
+            from_date: Reference date
+            
+        Returns:
+            Tuple of (days_until_delivery, delivery_date_string)
+        """
+        if from_date is None:
+            from_date = get_time_in_timezone(BUSINESS_TIMEZONE)
+        
+        # Get delivery schedule
+        schedule = DELIVERY_SCHEDULES[location]
+        delivery_days = schedule["days"]
+        delivery_hour = schedule["hour"]
+        
+        # Find next delivery
+        current_weekday = from_date.weekday()
+        weekday_map = {
+            'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3,
+            'Friday': 4, 'Saturday': 5, 'Sunday': 6
+        }
+        
+        delivery_weekdays = [weekday_map[day] for day in delivery_days]
+        
+        days_ahead = []
+        for delivery_weekday in delivery_weekdays:
+            if delivery_weekday > current_weekday:
+                days_ahead.append(delivery_weekday - current_weekday)
+            elif delivery_weekday == current_weekday:
+                if from_date.hour < delivery_hour:
+                    days_ahead.append(0)
+                else:
+                    days_ahead.append(7)
+            else:
+                days_ahead.append(7 - current_weekday + delivery_weekday)
+        
+        days_until = min(days_ahead)
+        next_delivery = from_date + timedelta(days=days_until)
+        next_delivery = next_delivery.replace(hour=delivery_hour, minute=0, second=0)
+        
+        if days_until == 0:
+            time_diff = next_delivery - from_date
+            days_until = time_diff.total_seconds() / (24 * 3600)
+        
+        return days_until, next_delivery.strftime('%Y-%m-%d')
 
-# Continue with the rest of the classes...
-# (Due to length limits, I'll continue in the next response)
+
+# Helper functions needed
+def get_time_in_timezone(timezone_str: str = None) -> datetime:
+    """Get current time in specified timezone."""
+    if not timezone_str:
+        return datetime.now()
+    
+    try:
+        import pytz
+        target_tz = pytz.timezone(timezone_str)
+        utc_now = datetime.utcnow().replace(tzinfo=pytz.UTC)
+        local_time = utc_now.astimezone(target_tz)
+        return local_time.replace(tzinfo=None)
+    except:
+        return datetime.now()
+
+# Constants needed
+BUSINESS_TIMEZONE = "America/Chicago"
+
+DELIVERY_SCHEDULES = {
+    "Avondale": {
+        "days": ["Monday", "Thursday"],
+        "hour": 12,
+        "request_schedule": {
+            "Tuesday": 8,
+            "Saturday": 8,
+        }
+    },
+    "Commissary": {
+        "days": ["Tuesday", "Thursday", "Saturday"],
+        "hour": 12,
+        "request_schedule": {
+            "Monday": 8,
+            "Wednesday": 8,
+            "Friday": 8,
+        }
+    }
+}
 
 # ===== TELEGRAM BOT INTERFACE =====
 
@@ -1537,6 +1666,9 @@ class TelegramBot:
         self.conversation_lock = threading.Lock()
         self.conversation_cleanup_interval = 1800  # 30 minutes
         self.last_cleanup_time = datetime.now()
+
+        # THE ENTRY HANDLE
+        self.entry_handler = EnhancedEntryHandler(self, notion_manager, calculator)
         
         # Rate limiting with exemptions
         self.user_commands: Dict[int, List[datetime]] = {}
@@ -1860,7 +1992,7 @@ class TelegramBot:
             try:
                 # Periodic cleanup
                 self._cleanup_stale_conversations()
-                
+                self.entry_handler.cleanup_expired_sessions()
                 # Get updates
                 updates = self.get_updates(timeout=25)
                 
@@ -1953,7 +2085,7 @@ class TelegramBot:
         handlers = {
             "/start": self._handle_start,
             "/help": self._handle_help,
-            "/entry": self._handle_entry,
+            "/entry": self.entry_handler.handle_entry_command,
             "/info": self._handle_info,
             "/order": self._handle_order,
             "/order_avondale": self._handle_order_avondale,
@@ -2008,6 +2140,11 @@ class TelegramBot:
         message = callback_query.get("message", {})
         chat_id = message.get("chat", {}).get("id")
         user_id = callback_query.get("from", {}).get("id")
+
+        # Route entry-related callbacks to entry handler
+        if data.startswith("entry_"):
+            self.entry_handler.handle_callback(callback_query)
+            return
         
         # Acknowledge callback
         self._make_request("answerCallbackQuery", 
@@ -2494,6 +2631,11 @@ class TelegramBot:
             self._handle_cancel(message)
             return True
 
+        if user_id in self.entry_handler.sessions:
+            session = self.entry_handler.sessions[user_id]
+            self.entry_handler.handle_text_input(message, session)
+            return
+
         # manual date entry
         if state.step == "choose_date":
             today = get_time_in_timezone(BUSINESS_TIMEZONE).strftime("%Y-%m-%d")
@@ -2508,7 +2650,7 @@ class TelegramBot:
             except ValueError:
                 self.send_message(chat_id, "Invalid date. Use YYYY-MM-DD or 'today'.")
             return True
-
+        
         # item quantities with /skip /done
         if state.step == "enter_items":
             if low == "/skip":
@@ -3128,6 +3270,575 @@ class TelegramBot:
         )
         
         return text
+
+# ===== Entry Point for Bot =====
+
+@dataclass
+class EntrySession:
+    """
+    Enhanced session state for conversational entry wizard.
+    """
+    user_id: int
+    chat_id: int
+    mode: str  # 'on_hand' or 'received'
+    location: str  # 'Avondale' or 'Commissary'
+    items: List[Dict[str, Any]]  # List of items with metadata
+    index: int = 0  # Current item index
+    answers: Dict[str, Optional[float]] = field(default_factory=dict)  # item_name -> quantity
+    started_at: datetime = field(default_factory=datetime.now)
+    expires_at: datetime = field(default_factory=lambda: datetime.now() + timedelta(hours=2))
+    last_message_id: Optional[int] = None
+    manager_name: str = "Manager"
+    notes: str = ""
+    
+    def is_expired(self) -> bool:
+        """Check if session has expired."""
+        return datetime.now() > self.expires_at
+    
+    def update_activity(self):
+        """Reset expiration timer on activity."""
+        self.expires_at = datetime.now() + timedelta(hours=2)
+    
+    def get_current_item(self) -> Optional[Dict[str, Any]]:
+        """Get current item being edited."""
+        if 0 <= self.index < len(self.items):
+            return self.items[self.index]
+        return None
+    
+    def move_back(self):
+        """Move to previous item."""
+        self.index = max(0, self.index - 1)
+    
+    def move_forward(self):
+        """Move to next item."""
+        self.index = min(len(self.items) - 1, self.index + 1)
+    
+    def skip_current(self):
+        """Mark current item as skipped and move forward."""
+        item = self.get_current_item()
+        if item:
+            self.answers[item['name']] = None
+        self.index += 1
+    
+    def set_current_quantity(self, quantity: float):
+        """Set quantity for current item."""
+        item = self.get_current_item()
+        if item:
+            self.answers[item['name']] = quantity
+    
+    def get_progress(self) -> str:
+        """Get progress string."""
+        return f"{self.index + 1}/{len(self.items)}"
+    
+    def get_answered_count(self) -> int:
+        """Count items with non-null answers."""
+        return sum(1 for v in self.answers.values() if v is not None)
+    
+    def get_total_quantity(self) -> float:
+        """Get sum of all entered quantities."""
+        return sum(v for v in self.answers.values() if v is not None)
+
+
+class EnhancedEntryHandler:
+    """
+    Enhanced entry handler with full navigation controls.
+    """
+    
+    def __init__(self, bot, notion_manager, calculator):
+        """Initialize with dependencies."""
+        self.bot = bot
+        self.notion = notion_manager
+        self.calc = calculator
+        self.logger = logging.getLogger('entry_wizard')
+        self.sessions: Dict[int, EntrySession] = {}
+    
+    def handle_entry_command(self, message: Dict):
+        """
+        Handle /entry command - check for existing session first.
+        """
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        
+        # Check for existing session
+        if user_id in self.sessions:
+            session = self.sessions[user_id]
+            if not session.is_expired():
+                # Offer to resume or start over
+                keyboard = self._create_keyboard([
+                    [("📂 Resume", "entry_resume"), ("🔄 Start Over", "entry_new")],
+                    [("❌ Cancel", "entry_cancel_existing")]
+                ])
+                
+                progress = session.get_progress()
+                mode_text = "On-Hand Count" if session.mode == "on_hand" else "Delivery"
+                
+                self.bot.send_message(
+                    chat_id,
+                    f"📋 <b>Active Session Found</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Type: {mode_text} for {session.location}\n"
+                    f"Progress: {progress} • Answered: {session.get_answered_count()}\n\n"
+                    f"What would you like to do?",
+                    reply_markup=keyboard
+                )
+                return
+        
+        # No active session - start new
+        self._start_new_entry(chat_id, user_id)
+    
+    def _start_new_entry(self, chat_id: int, user_id: int):
+        """Start new entry session."""
+        keyboard = self._create_keyboard([
+            [("🏪 Avondale", "entry_loc|Avondale")],
+            [("🏭 Commissary", "entry_loc|Commissary")],
+            [("❌ Cancel", "entry_cancel")]
+        ])
+        
+        self.bot.send_message(
+            chat_id,
+            "📝 <b>Inventory Entry Wizard</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Select location:",
+            reply_markup=keyboard
+        )
+    
+    def handle_callback(self, callback_query: Dict):
+        """Handle all entry-related callbacks."""
+        data = callback_query.get("data", "")
+        message = callback_query.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        user_id = callback_query.get("from", {}).get("id")
+        
+        # Acknowledge callback
+        self.bot._make_request("answerCallbackQuery", 
+                              {"callback_query_id": callback_query.get("id")})
+        
+        # Route callbacks
+        if data == "entry_resume":
+            self._resume_session(chat_id, user_id)
+        elif data == "entry_new":
+            self._delete_session(user_id)
+            self._start_new_entry(chat_id, user_id)
+        elif data.startswith("entry_loc|"):
+            location = data.split("|")[1]
+            self._handle_location_selection(chat_id, user_id, location)
+        elif data.startswith("entry_mode|"):
+            mode = data.split("|")[1]
+            self._handle_mode_selection(chat_id, user_id, mode)
+        elif data == "entry_back":
+            self._handle_back(chat_id, user_id)
+        elif data == "entry_skip":
+            self._handle_skip(chat_id, user_id)
+        elif data == "entry_done":
+            self._handle_done(chat_id, user_id)
+        elif data in ["entry_cancel", "entry_cancel_existing"]:
+            self._handle_cancel(chat_id, user_id)
+        elif data == "entry_submit":
+            self._handle_submit(chat_id, user_id)
+        elif data == "entry_resume_items":
+            self._resume_items(chat_id, user_id)
+    
+    def handle_text_input(self, message: Dict, session: EntrySession):
+        """Handle text input for quantity entry."""
+        text = message.get("text", "").strip()
+        chat_id = session.chat_id
+        
+        # Update session activity
+        session.update_activity()
+        
+        # Validate input
+        try:
+            # Check for special text commands
+            if text.lower() in ["/back", "back"]:
+                self._handle_back(chat_id, session.user_id)
+                return
+            elif text.lower() in ["/skip", "skip"]:
+                self._handle_skip(chat_id, session.user_id)
+                return
+            elif text.lower() in ["/done", "done"]:
+                self._handle_done(chat_id, session.user_id)
+                return
+            elif text.lower() in ["/cancel", "cancel"]:
+                self._handle_cancel(chat_id, session.user_id)
+                return
+            
+            # Parse as number
+            quantity = float(text)
+            
+            # Validate range
+            if quantity < 0:
+                self.bot.send_message(
+                    chat_id,
+                    "❌ Please enter a positive number or 0"
+                )
+                self._show_current_item(session)
+                return
+            
+            if quantity > 9999:
+                self.bot.send_message(
+                    chat_id,
+                    "⚠️ That seems very high. Please verify and re-enter."
+                )
+                self._show_current_item(session)
+                return
+            
+            # Save quantity and move forward
+            session.set_current_quantity(quantity)
+            session.index += 1
+            
+            # Show next item or complete
+            if session.index >= len(session.items):
+                self._handle_done(chat_id, session.user_id)
+            else:
+                self._show_current_item(session)
+                
+        except ValueError:
+            self.bot.send_message(
+                chat_id,
+                "❌ Please enter a valid number (e.g., 0, 1.5, 2)\n"
+                "Or use: back, skip, done, cancel"
+            )
+            self._show_current_item(session)
+    
+    def _handle_location_selection(self, chat_id: int, user_id: int, location: str):
+        """Handle location selection."""
+        # Create session
+        session = EntrySession(
+            user_id=user_id,
+            chat_id=chat_id,
+            location=location,
+            mode="",
+            items=[]
+        )
+        self.sessions[user_id] = session
+        
+        # Show mode selection
+        keyboard = self._create_keyboard([
+            [("📦 On-Hand Count", "entry_mode|on_hand")],
+            [("📥 Received Delivery", "entry_mode|received")],
+            [("❌ Cancel", "entry_cancel")]
+        ])
+        
+        self.bot.send_message(
+            chat_id,
+            f"📍 Location: <b>{location}</b>\n\n"
+            f"Select entry type:",
+            reply_markup=keyboard
+        )
+    
+    def _handle_mode_selection(self, chat_id: int, user_id: int, mode: str):
+        """Handle mode selection and start item entry."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "Session expired. Use /entry to start over.")
+            return
+        
+        session.mode = mode
+        
+        # Load items for location
+        items = self.notion.get_items_for_location(session.location)
+        session.items = [
+            {
+                'name': item.name,
+                'unit': item.unit_type,
+                'adu': item.adu,
+                'id': item.id
+            }
+            for item in items
+        ]
+        
+        if not session.items:
+            self.bot.send_message(
+                chat_id,
+                f"⚠️ No items found for {session.location}"
+            )
+            self._delete_session(user_id)
+            return
+        
+        # Initialize answers dict
+        for item in session.items:
+            session.answers[item['name']] = None
+        
+        # Start item entry
+        mode_text = "On-Hand Count" if mode == "on_hand" else "Delivery"
+        date = datetime.now().strftime('%Y-%m-%d')
+        
+        self.bot.send_message(
+            chat_id,
+            f"📝 <b>{session.location} • {mode_text}</b>\n"
+            f"📅 Date: {date}\n"
+            f"📦 Items: {len(session.items)}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Enter quantity for each item.\n"
+            f"You can use: back, skip, done, cancel"
+        )
+        
+        self._show_current_item(session)
+    
+    def _show_current_item(self, session: EntrySession):
+        """Display current item with navigation buttons."""
+        item = session.get_current_item()
+        if not item:
+            self._handle_done(session.chat_id, session.user_id)
+            return
+        
+        # Build message
+        progress = session.get_progress()
+        current_value = session.answers.get(item['name'])
+        
+        text = (
+            f"[{progress}] <b>{item['name']}</b>\n"
+            f"Unit: {item['unit']} • ADU: {item['adu']:.2f}/day\n"
+        )
+        
+        if current_value is not None:
+            text += f"💡 Current value: {current_value}\n"
+        
+        text += "\nEnter quantity:"
+        
+        # Create navigation buttons
+        buttons = []
+        
+        # First row: Back (if not first) and Skip
+        first_row = []
+        if session.index > 0:
+            first_row.append(("◀️ Back", "entry_back"))
+        first_row.append(("⏭️ Skip", "entry_skip"))
+        buttons.append(first_row)
+        
+        # Second row: Done and Cancel
+        buttons.append([
+            ("✅ Done", "entry_done"),
+            ("❌ Cancel", "entry_cancel")
+        ])
+        
+        keyboard = self._create_keyboard(buttons)
+        
+        self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
+    
+    def _handle_back(self, chat_id: int, user_id: int):
+        """Move back to previous item."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        if session.index > 0:
+            session.move_back()
+            self._show_current_item(session)
+        else:
+            self.bot.send_message(chat_id, "Already at first item.")
+            self._show_current_item(session)
+    
+    def _handle_skip(self, chat_id: int, user_id: int):
+        """Skip current item."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        session.skip_current()
+        
+        if session.index >= len(session.items):
+            self._handle_done(chat_id, user_id)
+        else:
+            self._show_current_item(session)
+    
+    def _handle_done(self, chat_id: int, user_id: int):
+        """Show review screen."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        # Build review summary
+        mode_text = "On-Hand Count" if session.mode == "on_hand" else "Delivery"
+        date = datetime.now().strftime('%Y-%m-%d')
+        
+        text = (
+            f"📋 <b>Review Your Entry</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Type: <b>{mode_text}</b>\n"
+            f"Location: <b>{session.location}</b>\n"
+            f"Date: <b>{date}</b>\n\n"
+        )
+        
+        # Group items by status
+        entered_items = []
+        skipped_items = []
+        
+        for item in session.items:
+            qty = session.answers.get(item['name'])
+            if qty is not None:
+                entered_items.append(f"  • {item['name']}: {qty} {item['unit']}")
+            else:
+                skipped_items.append(f"  • {item['name']}")
+        
+        if entered_items:
+            text += f"📦 <b>Entered ({len(entered_items)}):</b>\n"
+            text += "\n".join(entered_items[:20])  # Limit display
+            if len(entered_items) > 20:
+                text += f"\n  ...and {len(entered_items) - 20} more"
+            text += "\n\n"
+        
+        if skipped_items:
+            text += f"⏭️ <b>Skipped ({len(skipped_items)}):</b>\n"
+            text += "\n".join(skipped_items[:10])  # Limit display
+            if len(skipped_items) > 10:
+                text += f"\n  ...and {len(skipped_items) - 10} more"
+            text += "\n\n"
+        
+        # Summary stats
+        total_qty = session.get_total_quantity()
+        text += (
+            f"📊 <b>Summary:</b>\n"
+            f"  • Items entered: {session.get_answered_count()}/{len(session.items)}\n"
+            f"  • Total quantity: {total_qty:.1f}\n"
+        )
+        
+        # Action buttons
+        keyboard = self._create_keyboard([
+            [("✅ Submit", "entry_submit"), ("📝 Resume", "entry_resume_items")],
+            [("❌ Cancel", "entry_cancel")]
+        ])
+        
+        self.bot.send_message(chat_id, text, reply_markup=keyboard)
+    
+    def _handle_submit(self, chat_id: int, user_id: int):
+        """Submit the entry to Notion."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        # Prepare data for saving
+        quantities = {
+            name: (qty if qty is not None else 0.0)
+            for name, qty in session.answers.items()
+        }
+        
+        date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Save to Notion
+        try:
+            success = self.notion.save_inventory_transaction(
+                location=session.location,
+                entry_type=session.mode,
+                date=date,
+                manager=session.manager_name,
+                notes=session.notes,
+                quantities=quantities
+            )
+            
+            if success:
+                # Success message
+                mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
+                items_count = session.get_answered_count()
+                total_qty = session.get_total_quantity()
+                
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ <b>Entry Saved Successfully</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Location: {session.location}\n"
+                    f"Type: {mode_text}\n"
+                    f"Date: {date}\n"
+                    f"Items: {items_count}\n"
+                    f"Total: {total_qty:.1f} units\n\n"
+                    f"Use /info to see updated status"
+                )
+                
+                # Log for audit
+                self.logger.info(
+                    f"Entry submitted: {session.location} {mode_text} "
+                    f"by user {user_id}, {items_count} items, total {total_qty:.1f}"
+                )
+            else:
+                self.bot.send_message(
+                    chat_id,
+                    "⚠️ Failed to save to Notion. Please try again."
+                )
+                return
+                
+        except Exception as e:
+            self.logger.error(f"Error submitting entry: {e}", exc_info=True)
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Error saving entry. Please contact support."
+            )
+            return
+        
+        # Clean up session
+        self._delete_session(user_id)
+    
+    def _resume_items(self, chat_id: int, user_id: int):
+        """Resume item entry from review screen."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        # Reset to first unanswered item or last item
+        for i, item in enumerate(session.items):
+            if session.answers.get(item['name']) is None:
+                session.index = i
+                break
+        else:
+            # All answered, go to last item
+            session.index = len(session.items) - 1
+        
+        self._show_current_item(session)
+    
+    def _resume_session(self, chat_id: int, user_id: int):
+        """Resume existing session."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        session.update_activity()
+        self._show_current_item(session)
+    
+    def _handle_cancel(self, chat_id: int, user_id: int):
+        """Cancel and delete session."""
+        if user_id in self.sessions:
+            self._delete_session(user_id)
+            self.bot.send_message(
+                chat_id,
+                "❌ <b>Entry Cancelled</b>\n"
+                "No data was saved.\n\n"
+                "Use /entry to start over."
+            )
+        else:
+            self.bot.send_message(chat_id, "No active session to cancel.")
+    
+    def _delete_session(self, user_id: int):
+        """Delete a session."""
+        if user_id in self.sessions:
+            del self.sessions[user_id]
+            self.logger.debug(f"Deleted session for user {user_id}")
+    
+    def _create_keyboard(self, buttons: List[List[tuple]]) -> Dict:
+        """Create inline keyboard markup."""
+        return {
+            "inline_keyboard": [
+                [{"text": text, "callback_data": data} for text, data in row]
+                for row in buttons
+            ]
+        }
+    
+    def cleanup_expired_sessions(self):
+        """Clean up expired sessions periodically."""
+        expired_users = []
+        for user_id, session in self.sessions.items():
+            if session.is_expired():
+                expired_users.append(user_id)
+        
+        for user_id in expired_users:
+            self._delete_session(user_id)
+        
+        if expired_users:
+            self.logger.info(f"Cleaned up {len(expired_users)} expired entry sessions")
 
 
 # ===== MAIN APPLICATION =====

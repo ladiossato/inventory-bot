@@ -2834,27 +2834,36 @@ class TelegramBot:
             self._end_conversation(state.user_id)
 
     def _handle_info(self, message: Dict):
-        """Executive dashboard with mobile-optimized layout"""
+        """
+        Display inventory dashboard with FIXED consumption math.
+        Shows forecasted on-hand at delivery and post-delivery needs.
+        """
         import math
         chat_id = message["chat"]["id"]
         
-        def format_item_line(item: dict) -> str:
-            """Format a single critical item for mobile display"""
+        def format_critical_item(item: dict) -> str:
+            """Format critical item with forecasted values."""
             name = item.get("item_name", "Unknown")
             unit = item.get("unit_type", "unit")
             current = float(item.get("current_qty", 0))
-            need = float(item.get("consumption_need", 0))
-            order = math.ceil(max(0, need - current))
+            oh_delivery = float(item.get("oh_at_delivery", 0))
+            need = float(item.get("consumption_need", 0))  # This is Need_post
+            order = item.get("required_order_rounded", 0)
             
-            # Compact format with emoji indicators
-            if current == 0:
+            # Determine status icon based on severity
+            if oh_delivery == 0:
                 status_icon = "🚨"
-            elif current < need * 0.5:
+            elif oh_delivery < need * 0.3:
                 status_icon = "⚠️"
             else:
                 status_icon = "📉"
-                
-            return f"{status_icon} <b>{name}</b>\n   Order {order} {unit} • Have {current:.1f}/{need:.1f}"
+            
+            # Format the display
+            return (
+                f"{status_icon} <b>{name}</b>\n"
+                f"   Order {order} {unit} • Now: {current:.1f} → Delivery: {oh_delivery:.1f}\n"
+                f"   Need {need:.1f} for post-delivery window"
+            )
         
         try:
             now = get_time_in_timezone(BUSINESS_TIMEZONE)
@@ -2864,7 +2873,7 @@ class TelegramBot:
             # Header with timestamp
             text = (
                 "📊 <b>Inventory Dashboard</b>\n"
-                f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%b %d')}\n"
+                f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             )
             
@@ -2873,6 +2882,7 @@ class TelegramBot:
             a_green = avondale.get("status_counts", {}).get("GREEN", 0)
             a_days = avondale.get("days_until_delivery", 0)
             a_delivery = avondale.get("delivery_date", "—")
+            a_cycle = avondale.get("order_cycle", {})
             
             text += (
                 "🏪 <b>AVONDALE</b>\n"
@@ -2880,17 +2890,21 @@ class TelegramBot:
                 f"├ Status: 🔴 {a_red} • 🟢 {a_green}\n"
             )
             
-            # Avondale critical items (top 5)
-            a_critical = [item for item in avondale.get("items", []) if item.get("status") == "RED"]
+            # Avondale critical items
+            a_critical = [item for item in avondale.get("items", []) 
+                        if item.get("status") == "RED"]
             if a_critical:
                 text += "└ <b>Critical Items:</b>\n"
-                for item in a_critical[:5]:
-                    lines = format_item_line(item).split('\n')
-                    text += f"  {lines[0]}\n  {lines[1]}\n"
+                for item in sorted(a_critical, 
+                                key=lambda x: x.get("required_order_rounded", 0), 
+                                reverse=True)[:5]:
+                    lines = format_critical_item(item).split('\n')
+                    for line in lines:
+                        text += f"  {line}\n"
                 if len(a_critical) > 5:
-                    text += f"  <i>...and {len(a_critical) - 5} more</i>\n"
+                    text += f"  <i>...and {len(a_critical) - 5} more critical</i>\n"
             else:
-                text += "└ ✅ All items sufficient\n"
+                text += "└ ✅ All items sufficient through next delivery\n"
             
             text += "\n"
             
@@ -2899,6 +2913,7 @@ class TelegramBot:
             c_green = commissary.get("status_counts", {}).get("GREEN", 0)
             c_days = commissary.get("days_until_delivery", 0)
             c_delivery = commissary.get("delivery_date", "—")
+            c_cycle = commissary.get("order_cycle", {})
             
             text += (
                 "🏭 <b>COMMISSARY</b>\n"
@@ -2906,56 +2921,66 @@ class TelegramBot:
                 f"├ Status: 🔴 {c_red} • 🟢 {c_green}\n"
             )
             
-            # Commissary critical items (top 5)
-            c_critical = [item for item in commissary.get("items", []) if item.get("status") == "RED"]
+            # Commissary critical items
+            c_critical = [item for item in commissary.get("items", []) 
+                        if item.get("status") == "RED"]
             if c_critical:
                 text += "└ <b>Critical Items:</b>\n"
-                for item in c_critical[:5]:
-                    lines = format_item_line(item).split('\n')
-                    text += f"  {lines[0]}\n  {lines[1]}\n"
+                for item in sorted(c_critical, 
+                                key=lambda x: x.get("required_order_rounded", 0), 
+                                reverse=True)[:5]:
+                    lines = format_critical_item(item).split('\n')
+                    for line in lines:
+                        text += f"  {line}\n"
                 if len(c_critical) > 5:
-                    text += f"  <i>...and {len(c_critical) - 5} more</i>\n"
+                    text += f"  <i>...and {len(c_critical) - 5} more critical</i>\n"
             else:
-                text += "└ ✅ All items sufficient\n"
+                text += "└ ✅ All items sufficient through next delivery\n"
             
-            # Footer with quick actions
+            # Footer with explanation
             text += (
                 "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "💡 Quick Actions:\n"
-                "• /order for supplier-ready lists\n"
-                "• /entry to update counts"
+                "📌 <b>How to read:</b>\n"
+                "• Now → Delivery: consumption forecast\n"
+                "• Need: required for post-delivery period\n"
+                "• /order for supplier-ready list"
             )
             
             self.send_message(chat_id, text)
+            self.logger.info(f"/info sent - A: {a_red} red, C: {c_red} red")
             
         except Exception as e:
             self.logger.error(f"/info failed: {e}", exc_info=True)
             self.send_message(chat_id, "⚠️ Unable to generate dashboard. Please try again.")
-        
 
 
     def _handle_order(self, message: Dict):
-        """Combined order list with visual hierarchy"""
+        """
+        Generate combined purchase orders with FIXED consumption math.
+        Shows forecasted on-hand at delivery for transparency.
+        """
         import math
         chat_id = message["chat"]["id"]
         
         def format_order_section(location: str, summary: dict, emoji: str) -> str:
-            """Format order section for a location"""
+            """Format order section with proper forecasting."""
             delivery = summary.get("delivery_date", "—")
             requests = summary.get("requests", [])
+            cycle = summary.get("order_cycle", {})
             
             # Calculate totals by unit type
             totals = {}
             order_lines = []
             
             for item in requests:
-                qty = math.ceil(float(item.get("requested_qty", 0)))
+                qty = item.get("requested_qty", 0)
                 if qty <= 0:
                     continue
                     
                 name = item.get("item_name", "Unknown")
                 unit = item.get("unit_type", "unit")
                 current = float(item.get("current_qty", 0))
+                oh_delivery = float(item.get("oh_at_delivery", 0))
                 need = float(item.get("consumption_need", 0))
                 
                 totals[unit] = totals.get(unit, 0) + qty
@@ -2964,6 +2989,7 @@ class TelegramBot:
                     'name': name,
                     'unit': unit,
                     'current': current,
+                    'oh_delivery': oh_delivery,
                     'need': need
                 })
             
@@ -2974,6 +3000,11 @@ class TelegramBot:
             text = f"{emoji} <b>{location.upper()} ORDER</b>\n"
             text += f"📅 Delivery: {delivery}\n"
             
+            if cycle:
+                days_pre = cycle.get('days_pre', 0)
+                days_post = cycle.get('days_post', 0)
+                text += f"📊 Coverage: {days_post} days after delivery\n"
+            
             if not order_lines:
                 text += "✅ No items needed\n"
                 return text
@@ -2983,10 +3014,14 @@ class TelegramBot:
             text += " • ".join(f"{v} {k}" for k, v in sorted(totals.items()))
             text += f"\n\n"
             
-            # Item list
-            for item in order_lines[:10]:  # Limit to top 10 for mobile
+            # Item list (compact for mobile)
+            for item in order_lines[:10]:
                 text += f"<b>{item['qty']} {item['unit']}</b> — {item['name']}\n"
-                text += f"  Current: {item['current']:.1f} • Need: {item['need']:.1f}\n"
+                # Show burn-down if significant
+                if abs(item['current'] - item['oh_delivery']) > 0.1:
+                    text += f"  {item['current']:.1f} now → {item['oh_delivery']:.1f} at delivery\n"
+                else:
+                    text += f"  Current: {item['current']:.1f} • Need: {item['need']:.1f}\n"
             
             if len(order_lines) > 10:
                 text += f"<i>...and {len(order_lines) - 10} more items</i>\n"
@@ -3008,21 +3043,25 @@ class TelegramBot:
             
             text += (
                 "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📌 <b>Note:</b> Quantities rounded up for ordering\n"
-                "💡 Use location-specific commands:\n"
-                "  • /order_avondale\n"
-                "  • /order_commissary"
+                "📌 Quantities rounded up for ordering\n"
+                "💡 Orders sized for post-delivery period\n"
+                "• /order_avondale • /order_commissary"
             )
             
             self.send_message(chat_id, text)
+            self.logger.info(f"/order sent successfully")
             
         except Exception as e:
             self.logger.error(f"/order failed: {e}", exc_info=True)
             self.send_message(chat_id, "⚠️ Unable to generate orders. Please try again.")
 
 
+
     def _handle_order_avondale(self, message: Dict):
-        """Avondale-specific order with supplier format"""
+        """
+        Avondale-specific order with FIXED consumption math.
+        Supplier-ready format with clear forecasting.
+        """
         import math
         chat_id = message["chat"]["id"]
         
@@ -3030,13 +3069,14 @@ class TelegramBot:
             summary = self.calc.generate_auto_requests("Avondale")
             delivery = summary.get("delivery_date", "—")
             requests = summary.get("requests", [])
+            cycle = summary.get("order_cycle", {})
             
             # Process and sort orders
             orders = []
             totals = {}
             
             for item in requests:
-                qty = math.ceil(float(item.get("requested_qty", 0)))
+                qty = item.get("requested_qty", 0)
                 if qty <= 0:
                     continue
                 
@@ -3048,6 +3088,7 @@ class TelegramBot:
                     'name': item.get("item_name", "Unknown"),
                     'unit': unit,
                     'current': float(item.get("current_qty", 0)),
+                    'oh_delivery': float(item.get("oh_at_delivery", 0)),
                     'need': float(item.get("consumption_need", 0))
                 })
             
@@ -3058,8 +3099,19 @@ class TelegramBot:
                 "🏪 <b>AVONDALE PURCHASE ORDER</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📅 Delivery Date: <b>{delivery}</b>\n"
-                f"📦 Items to Order: <b>{len(orders)}</b>\n\n"
             )
+            
+            # Show order timing if available
+            if cycle:
+                days_pre = cycle.get('days_pre', 0)
+                days_post = cycle.get('days_post', 0)
+                text += (
+                    f"📊 Order Window:\n"
+                    f"  • Burn-down days: {days_pre}\n"
+                    f"  • Coverage days: {days_post}\n"
+                )
+            
+            text += f"📦 Items to Order: <b>{len(orders)}</b>\n\n"
             
             if orders:
                 # Summary by unit type
@@ -3071,31 +3123,46 @@ class TelegramBot:
                 text += "─" * 28 + "\n"
                 
                 for item in orders:
+                    # Checkbox format for suppliers
                     text += f"☐ <b>{item['qty']} {item['unit']}</b> — {item['name']}\n"
-                    stock_info = f"Stock: {item['current']:.1f} • Need: {item['need']:.1f}"
-                    text += f"  <i>{stock_info}</i>\n"
+                    
+                    # Show stock forecast details
+                    burn_down = item['current'] - item['oh_delivery']
+                    if burn_down > 0.1:
+                        text += (
+                            f"  Stock: {item['current']:.1f} → "
+                            f"{item['oh_delivery']:.1f} (burn {burn_down:.1f})\n"
+                        )
+                    else:
+                        text += f"  Stock: {item['current']:.1f}\n"
+                    text += f"  Need: {item['need']:.1f} for {cycle.get('days_post', 0)} days\n"
                 
                 text += (
                     "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     "✅ Ready to send to supplier\n"
-                    "📱 Screenshot or forward this message"
+                    "📱 Screenshot or forward this order\n"
+                    "💡 Accounts for consumption to delivery"
                 )
             else:
                 text += (
                     "✅ <b>No Orders Needed</b>\n\n"
                     "All inventory levels are sufficient\n"
-                    "until the next delivery."
+                    "through the next delivery cycle."
                 )
             
             self.send_message(chat_id, text)
+            self.logger.info(f"/order_avondale sent - {len(orders)} items")
             
         except Exception as e:
             self.logger.error(f"/order_avondale failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate Avondale orders.")
+            self.send_message(chat_id, "⚠️ Unable to generate Avondale order. Please try again.")
 
 
     def _handle_order_commissary(self, message: Dict):
-        """Commissary-specific order with supplier format"""
+        """
+        Commissary-specific order with FIXED consumption math.
+        Supplier-ready format with clear forecasting.
+        """
         import math
         chat_id = message["chat"]["id"]
         
@@ -3103,13 +3170,14 @@ class TelegramBot:
             summary = self.calc.generate_auto_requests("Commissary")
             delivery = summary.get("delivery_date", "—")
             requests = summary.get("requests", [])
+            cycle = summary.get("order_cycle", {})
             
             # Process and sort orders
             orders = []
             totals = {}
             
             for item in requests:
-                qty = math.ceil(float(item.get("requested_qty", 0)))
+                qty = item.get("requested_qty", 0)
                 if qty <= 0:
                     continue
                 
@@ -3121,6 +3189,7 @@ class TelegramBot:
                     'name': item.get("item_name", "Unknown"),
                     'unit': unit,
                     'current': float(item.get("current_qty", 0)),
+                    'oh_delivery': float(item.get("oh_at_delivery", 0)),
                     'need': float(item.get("consumption_need", 0))
                 })
             
@@ -3131,8 +3200,19 @@ class TelegramBot:
                 "🏭 <b>COMMISSARY PURCHASE ORDER</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📅 Delivery Date: <b>{delivery}</b>\n"
-                f"📦 Items to Order: <b>{len(orders)}</b>\n\n"
             )
+            
+            # Show order timing if available
+            if cycle:
+                days_pre = cycle.get('days_pre', 0)
+                days_post = cycle.get('days_post', 0)
+                text += (
+                    f"📊 Order Window:\n"
+                    f"  • Burn-down days: {days_pre}\n"
+                    f"  • Coverage days: {days_post}\n"
+                )
+            
+            text += f"📦 Items to Order: <b>{len(orders)}</b>\n\n"
             
             if orders:
                 # Summary by unit type
@@ -3144,52 +3224,159 @@ class TelegramBot:
                 text += "─" * 28 + "\n"
                 
                 for item in orders:
+                    # Checkbox format for suppliers
                     text += f"☐ <b>{item['qty']} {item['unit']}</b> — {item['name']}\n"
-                    stock_info = f"Stock: {item['current']:.1f} • Need: {item['need']:.1f}"
-                    text += f"  <i>{stock_info}</i>\n"
+                    
+                    # Show stock forecast details
+                    burn_down = item['current'] - item['oh_delivery']
+                    if burn_down > 0.1:
+                        text += (
+                            f"  Stock: {item['current']:.1f} → "
+                            f"{item['oh_delivery']:.1f} (burn {burn_down:.1f})\n"
+                        )
+                    else:
+                        text += f"  Stock: {item['current']:.1f}\n"
+                    text += f"  Need: {item['need']:.1f} for {cycle.get('days_post', 0)} days\n"
                 
                 text += (
                     "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     "✅ Ready to send to supplier\n"
-                    "📱 Screenshot or forward this message"
+                    "📱 Screenshot or forward this order\n"
+                    "💡 Accounts for consumption to delivery"
                 )
             else:
                 text += (
                     "✅ <b>No Orders Needed</b>\n\n"
                     "All inventory levels are sufficient\n"
-                    "until the next delivery."
+                    "through the next delivery cycle."
                 )
             
             self.send_message(chat_id, text)
+            self.logger.info(f"/order_commissary sent - {len(orders)} items")
             
         except Exception as e:
             self.logger.error(f"/order_commissary failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate Commissary orders.")
+            self.send_message(chat_id, "⚠️ Unable to generate Commissary order. Please try again.")
 
 
     def _handle_reassurance(self, message: Dict):
-        """Daily risk assessment - FIXED to prevent duplicates."""
+        """
+        Daily risk assessment with FIXED consumption math.
+        Shows which items won't make it to delivery based on burn-down.
+        """
         chat_id = message["chat"]["id"]
         
         try:
             avondale = self.calc.calculate_location_summary("Avondale")
             commissary = self.calc.calculate_location_summary("Commissary")
             
+            # Get critical items that need immediate attention
             a_critical = [item for item in avondale.get("items", []) 
-                         if item.get("status") == "RED"]
+                        if item.get("status") == "RED"]
             c_critical = [item for item in commissary.get("items", []) 
-                         if item.get("status") == "RED"]
+                        if item.get("status") == "RED"]
             total_critical = len(a_critical) + len(c_critical)
             
             now = get_time_in_timezone(BUSINESS_TIMEZONE)
             
             if total_critical == 0:
-                text = self._format_reassurance_clear(now, avondale, commissary)
+                # All clear message
+                text = (
+                    "✅ <b>DAILY RISK ASSESSMENT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
+                    
+                    "🟢 <b>ALL CLEAR</b>\n"
+                    "No critical inventory issues detected\n\n"
+                    
+                    "📊 <b>Location Status</b>\n"
+                )
+                
+                # Avondale status
+                a_cycle = avondale.get("order_cycle", {})
+                text += (
+                    f"├ 🏪 Avondale: {avondale['status_counts']['GREEN']} items OK\n"
+                    f"│  Next delivery: {avondale['delivery_date']}\n"
+                    f"│  Coverage window: {a_cycle.get('days_post', 0)} days\n"
+                )
+                
+                # Commissary status
+                c_cycle = commissary.get("order_cycle", {})
+                text += (
+                    f"├ 🏭 Commissary: {commissary['status_counts']['GREEN']} items OK\n"
+                    f"│  Next delivery: {commissary['delivery_date']}\n"
+                    f"│  Coverage window: {c_cycle.get('days_post', 0)} days\n"
+                )
+                
+                text += (
+                    f"└ Total Coverage: 100%\n\n"
+                    
+                    "✅ All levels sufficient through delivery\n"
+                    "✅ Orders sized for post-delivery needs\n"
+                    "✅ No immediate action required\n\n"
+                    
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "💚 <b>System Status: Healthy</b>"
+                )
             else:
-                text = self._format_reassurance_alert(now, total_critical, 
-                                                      a_critical, c_critical)
+                # Critical items alert
+                text = (
+                    "🚨 <b>DAILY RISK ASSESSMENT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
+                    
+                    f"⚠️ <b>ACTION REQUIRED</b>\n"
+                    f"{total_critical} item{'s' if total_critical != 1 else ''} need ordering\n\n"
+                )
+                
+                if a_critical:
+                    a_cycle = avondale.get("order_cycle", {})
+                    text += f"🏪 <b>AVONDALE ({len(a_critical)} critical)</b>\n"
+                    text += f"Delivery: {avondale['delivery_date']} • "
+                    text += f"Coverage: {a_cycle.get('days_post', 0)} days\n\n"
+                    
+                    for item in sorted(a_critical, 
+                                    key=lambda x: x.get('oh_at_delivery', 0))[:5]:
+                        oh_delivery = item.get('oh_at_delivery', 0)
+                        need = item.get('consumption_need', 0)
+                        order = item.get('required_order_rounded', 0)
+                        
+                        text += f"🔴 <b>{item['item_name']}</b>\n"
+                        text += f"   At delivery: {oh_delivery:.1f} {item['unit_type']}\n"
+                        text += f"   Need: {need:.1f} • Order: {order}\n"
+                    
+                    if len(a_critical) > 5:
+                        text += f"<i>...plus {len(a_critical) - 5} more</i>\n"
+                    text += "\n"
+                
+                if c_critical:
+                    c_cycle = commissary.get("order_cycle", {})
+                    text += f"🏭 <b>COMMISSARY ({len(c_critical)} critical)</b>\n"
+                    text += f"Delivery: {commissary['delivery_date']} • "
+                    text += f"Coverage: {c_cycle.get('days_post', 0)} days\n\n"
+                    
+                    for item in sorted(c_critical, 
+                                    key=lambda x: x.get('oh_at_delivery', 0))[:5]:
+                        oh_delivery = item.get('oh_at_delivery', 0)
+                        need = item.get('consumption_need', 0)
+                        order = item.get('required_order_rounded', 0)
+                        
+                        text += f"🔴 <b>{item['item_name']}</b>\n"
+                        text += f"   At delivery: {oh_delivery:.1f} {item['unit_type']}\n"
+                        text += f"   Need: {need:.1f} • Order: {order}\n"
+                    
+                    if len(c_critical) > 5:
+                        text += f"<i>...plus {len(c_critical) - 5} more</i>\n"
+                
+                text += (
+                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "⚠️ <b>IMMEDIATE ACTION NEEDED</b>\n"
+                    "These items need ordering NOW\n\n"
+                    "📞 Contact supplier immediately\n"
+                    "📋 Use /order for complete list"
+                )
             
-            # FIXED: Only send to reassurance chat if it's different
+            # Send to reassurance chat if different from requester
             reassurance_chat = self.chat_config.get('reassurance')
             if reassurance_chat and reassurance_chat != chat_id:
                 self.send_message(reassurance_chat, text)
@@ -3197,10 +3384,13 @@ class TelegramBot:
             
             # Always send to requesting user
             self.send_message(chat_id, text)
+            self.logger.info(f"/reassurance sent - {total_critical} critical items")
             
         except Exception as e:
-            self.logger.error(f"Error in reassurance: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate risk assessment.")
+            self.logger.error(f"/reassurance failed: {e}", exc_info=True)
+            self.send_message(chat_id, "⚠️ Unable to generate risk assessment. Please try again.")
+
+            
     
     def _format_reassurance_clear(self, now, avondale, commissary):
         """Format all-clear reassurance message."""

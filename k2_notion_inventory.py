@@ -2976,14 +2976,13 @@ class TelegramBot:
 
     def _handle_order(self, message: Dict):
         """
-        Generate combined purchase orders with FIXED consumption math.
-        Shows forecasted on-hand at delivery for transparency.
+        Generate combined purchase orders with team notification format.
         """
         import math
         chat_id = message["chat"]["id"]
         
         def format_order_section(location: str, summary: dict, emoji: str) -> str:
-            """Format order section with proper forecasting."""
+            """Format order section with clean layout."""
             delivery = summary.get("delivery_date", "—")
             requests = summary.get("requests", [])
             cycle = summary.get("order_cycle", {})
@@ -3019,11 +3018,6 @@ class TelegramBot:
             # Build section text
             text = f"{emoji} <b>{location.upper()} ORDER</b>\n"
             text += f"📅 Delivery: {delivery}\n"
-            
-            if cycle:
-                days_pre = cycle.get('days_pre', 0)
-                days_post = cycle.get('days_post', 0)
-                text += f"📊 Coverage: {days_post} days after delivery\n"
             
             if not order_lines:
                 text += "✅ No items needed\n"
@@ -3061,10 +3055,38 @@ class TelegramBot:
             text += "\n" + ("─" * 28) + "\n\n"
             text += format_order_section("Commissary", commissary, "🏭")
             
+            # Team messages
             text += (
                 "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📌 Quantities rounded up for ordering\n"
-                "💡 Orders sized for post-delivery period\n"
+                "📱 <b>Team Messages:</b>\n\n"
+            )
+            
+            # Avondale team message if items needed
+            if avondale.get("requests"):
+                a_delivery = avondale.get("delivery_date", "")
+                a_totals = {}
+                for item in avondale.get("requests", []):
+                    unit = item.get("unit_type", "unit")
+                    qty = item.get("requested_qty", 0)
+                    a_totals[unit] = a_totals.get(unit, 0) + qty
+                
+                a_summary = " • ".join(f"{v} {k}" for k, v in sorted(a_totals.items()))
+                text += f"<i>Avondale team: Please order {a_summary} for {a_delivery} delivery.</i>\n\n"
+            
+            # Commissary team message if items needed
+            if commissary.get("requests"):
+                c_delivery = commissary.get("delivery_date", "")
+                c_totals = {}
+                for item in commissary.get("requests", []):
+                    unit = item.get("unit_type", "unit")
+                    qty = item.get("requested_qty", 0)
+                    c_totals[unit] = c_totals.get(unit, 0) + qty
+                
+                c_summary = " • ".join(f"{v} {k}" for k, v in sorted(c_totals.items()))
+                text += f"<i>Commissary team: Please order {c_summary} for {c_delivery} delivery.</i>\n"
+            
+            text += (
+                "\n💡 Orders account for consumption to delivery\n"
                 "• /order_avondale • /order_commissary"
             )
             
@@ -3076,11 +3098,9 @@ class TelegramBot:
             self.send_message(chat_id, "⚠️ Unable to generate orders. Please try again.")
 
 
-
     def _handle_order_avondale(self, message: Dict):
         """
-        Avondale-specific order with FIXED consumption math.
-        Supplier-ready format with clear forecasting.
+        Avondale-specific order with clean format and team message.
         """
         import math
         chat_id = message["chat"]["id"]
@@ -3143,8 +3163,8 @@ class TelegramBot:
                 text += "─" * 28 + "\n"
                 
                 for item in orders:
-                    # Checkbox format for suppliers
-                    text += f"☐ <b>{item['qty']} {item['unit']}</b> — {item['name']}\n"
+                    # Clean format without checkbox
+                    text += f"{item['qty']} {item['unit']} — {item['name']}\n"
                     
                     # Show stock forecast details
                     burn_down = item['current'] - item['oh_delivery']
@@ -3157,12 +3177,17 @@ class TelegramBot:
                         text += f"  Stock: {item['current']:.1f}\n"
                     text += f"  Need: {item['need']:.1f} for {cycle.get('days_post', 0)} days\n"
                 
+                # Team message
+                totals_summary = " • ".join(f"{v} {k}" for k, v in sorted(totals.items()))
+                
                 text += (
                     "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📱 <b>Team Message:</b>\n"
+                    f"<i>Please order {totals_summary} for {delivery} delivery. "
+                    f"This covers {cycle.get('days_post', 0)} days after delivery.</i>\n\n"
                     "✅ Ready to send to supplier\n"
-                    "📱 Screenshot or forward this order\n"
-                    "💡 Accounts for consumption to delivery"
-                )
+                    "💡 Accounts for {days_pre} day burn-down"
+                ).format(days_pre=cycle.get('days_pre', 0))
             else:
                 text += (
                     "✅ <b>No Orders Needed</b>\n\n"
@@ -3180,8 +3205,7 @@ class TelegramBot:
 
     def _handle_order_commissary(self, message: Dict):
         """
-        Commissary-specific order with FIXED consumption math.
-        Supplier-ready format with clear forecasting.
+        Commissary-specific order with clean format and team message.
         """
         import math
         chat_id = message["chat"]["id"]
@@ -3244,8 +3268,8 @@ class TelegramBot:
                 text += "─" * 28 + "\n"
                 
                 for item in orders:
-                    # Checkbox format for suppliers
-                    text += f"☐ <b>{item['qty']} {item['unit']}</b> — {item['name']}\n"
+                    # Clean format without checkbox
+                    text += f"{item['qty']} {item['unit']} — {item['name']}\n"
                     
                     # Show stock forecast details
                     burn_down = item['current'] - item['oh_delivery']
@@ -3258,12 +3282,17 @@ class TelegramBot:
                         text += f"  Stock: {item['current']:.1f}\n"
                     text += f"  Need: {item['need']:.1f} for {cycle.get('days_post', 0)} days\n"
                 
+                # Team message
+                totals_summary = " • ".join(f"{v} {k}" for k, v in sorted(totals.items()))
+                
                 text += (
                     "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📱 <b>Team Message:</b>\n"
+                    f"<i>Please order {totals_summary} for {delivery} delivery. "
+                    f"This covers {cycle.get('days_post', 0)} days after delivery.</i>\n\n"
                     "✅ Ready to send to supplier\n"
-                    "📱 Screenshot or forward this order\n"
-                    "💡 Accounts for consumption to delivery"
-                )
+                    "💡 Accounts for {days_pre} day burn-down"
+                ).format(days_pre=cycle.get('days_pre', 0))
             else:
                 text += (
                     "✅ <b>No Orders Needed</b>\n\n"

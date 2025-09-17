@@ -954,6 +954,319 @@ class NotionManager:
         self.logger.debug(f"Retrieved {len(items)} items for {location} in {duration_ms:.2f}ms")
         
         return items
+
+    # ===== SHORTAGE TRACKING ENHANCEMENTS =====
+
+    # Add this method to the NotionManager class
+    def save_order_transaction(self, location: str, date: str, manager: str, 
+                            notes: str, quantities: Dict[str, float]) -> bool:
+        """
+        Save order transaction to track what was ordered.
+        
+        Args:
+            location: Location name
+            date: Date in YYYY-MM-DD format
+            manager: Manager name (becomes page title)
+            notes: Optional notes
+            quantities: Dict mapping item names to ordered quantities
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Create order title for tracking
+            total_items = sum(1 for qty in quantities.values() if qty > 0)
+            title = f"{manager} • Order Placed • {date} • {location} ({total_items} items)"
+            
+            # Format quantities as readable summary
+            quantities_summary = []
+            for item_name, qty in quantities.items():
+                if qty > 0:
+                    quantities_summary.append(f"{item_name}: {qty}")
+            
+            quantities_display = "\n".join(quantities_summary) if quantities_summary else "No items ordered"
+            
+            # Build properties
+            properties = {
+                'Manager': {
+                    'title': [
+                        {
+                            'text': {
+                                'content': title
+                            }
+                        }
+                    ]
+                },
+                'Date': {
+                    'date': {
+                        'start': date
+                    }
+                },
+                'Location': {
+                    'select': {
+                        'name': location
+                    }
+                },
+                'Type': {
+                    'select': {
+                        'name': 'Order'  # New type for orders
+                    }
+                },
+                'Quantities': {
+                    'rich_text': [
+                        {
+                            'text': {
+                                'content': quantities_display
+                            }
+                        }
+                    ]
+                }
+            }
+            
+            # Add notes if provided
+            if notes:
+                properties['Notes'] = {
+                    'rich_text': [
+                        {
+                            'text': {
+                                'content': notes
+                            }
+                        }
+                    ]
+                }
+            
+            # Store raw JSON data for processing
+            quantities_json = json.dumps(quantities)
+            properties['Quantities JSON'] = {
+                'rich_text': [
+                    {
+                        'text': {
+                            'content': quantities_json
+                        }
+                    }
+                ]
+            }
+            
+            # Create the page
+            page_data = {
+                'parent': {
+                    'database_id': self.inventory_db_id
+                },
+                'properties': properties
+            }
+            
+            response = self._make_request('POST', '/pages', page_data)
+            
+            if response:
+                self.logger.info(f"Saved order transaction: {title}")
+                return True
+            else:
+                self.logger.error(f"Failed to save order transaction")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error saving order transaction: {e}")
+            return False
+
+    def get_transactions_by_type_and_date(self, location: str, transaction_type: str, 
+                                        start_date: str = None, end_date: str = None) -> List[Dict]:
+        """
+        Get transactions by type within date range.
+        
+        Args:
+            location: Location name
+            transaction_type: 'Order', 'On-Hand', or 'Received'
+            start_date: Start date filter (YYYY-MM-DD)
+            end_date: End date filter (YYYY-MM-DD)
+            
+        Returns:
+            List of transaction records with parsed quantities
+        """
+        try:
+            # Build query filter
+            filter_conditions = [
+                {"property": "Location", "select": {"equals": location}},
+                {"property": "Type", "select": {"equals": transaction_type}},
+            ]
+            
+            # Add date filters if provided
+            if start_date:
+                filter_conditions.append({
+                    "property": "Date",
+                    "date": {"on_or_after": start_date}
+                })
+            
+            if end_date:
+                filter_conditions.append({
+                    "property": "Date", 
+                    "date": {"on_or_before": end_date}
+                })
+            
+            query = {
+                "filter": {"and": filter_conditions},
+                "sorts": [{"property": "Date", "direction": "descending"}]
+            }
+            
+            response = self._make_request("POST", f"/databases/{self.inventory_db_id}/query", query)
+            
+            if not response:
+                return []
+            
+            transactions = []
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                
+                # Extract date
+                date_prop = props.get("Date", {}).get("date")
+                date = date_prop.get("start") if date_prop else None
+                
+                # Extract quantities JSON
+                json_prop = props.get("Quantities JSON") or props.get("Quantities")
+                quantities = {}
+                
+                if json_prop and json_prop.get("rich_text"):
+                    raw_json = "".join(
+                        segment.get("plain_text", "")
+                        for segment in json_prop["rich_text"]
+                    ).strip()
+                    
+                    if raw_json:
+                        try:
+                            quantities = json.loads(raw_json)
+                        except json.JSONDecodeError:
+                            self.logger.warning(f"Invalid JSON in transaction: {page['id']}")
+                
+                # Add transaction record
+                transactions.append({
+                    'id': page['id'],
+                    'date': date,
+                    'type': transaction_type,
+                    'location': location,
+                    'quantities': quantities,
+                    'created_time': page.get('created_time')
+                })
+            
+            self.logger.debug(f"Retrieved {len(transactions)} {transaction_type} transactions for {location}")
+            return transactions
+            
+        except Exception as e:
+            self.logger.error(f"Error getting transactions: {e}")
+            return []
+
+    def calculate_shortages(self, location: str, days_back: int = 7) -> Dict[str, Any]:
+        """
+        Calculate shortages by comparing orders to received deliveries.
+        
+        Args:
+            location: Location name
+            days_back: How many days back to analyze
+            
+        Returns:
+            Dict with shortage analysis
+        """
+        try:
+            from datetime import datetime, timedelta
+            
+            # Calculate date range
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            
+            # Get transactions
+            orders = self.get_transactions_by_type_and_date(location, "Order", start_date, end_date)
+            received = self.get_transactions_by_type_and_date(location, "Received", start_date, end_date)
+            
+            # Group by date for comparison
+            orders_by_date = {t['date']: t['quantities'] for t in orders if t['date']}
+            received_by_date = {t['date']: t['quantities'] for t in received if t['date']}
+            
+            shortages = []
+            total_ordered_items = 0
+            total_received_items = 0
+            total_shortage_items = 0
+            
+            # Compare each order to corresponding delivery
+            for order_date, ordered_qty in orders_by_date.items():
+                # Find matching received delivery (could be same day or day after)
+                received_qty = None
+                received_date = None
+                
+                # Check same day first
+                if order_date in received_by_date:
+                    received_qty = received_by_date[order_date]
+                    received_date = order_date
+                else:
+                    # Check next day
+                    try:
+                        next_day = (datetime.strptime(order_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+                        if next_day in received_by_date:
+                            received_qty = received_by_date[next_day]
+                            received_date = next_day
+                    except:
+                        pass
+                
+                if received_qty is None:
+                    # No delivery found - everything is shorted
+                    for item, qty in ordered_qty.items():
+                        if qty > 0:
+                            shortages.append({
+                                'item_name': item,
+                                'ordered': qty,
+                                'received': 0,
+                                'shortage': qty,
+                                'order_date': order_date,
+                                'delivery_date': None,
+                                'status': 'NOT_DELIVERED'
+                            })
+                            total_ordered_items += qty
+                            total_shortage_items += qty
+                else:
+                    # Compare quantities item by item
+                    all_items = set(ordered_qty.keys()) | set(received_qty.keys())
+                    
+                    for item in all_items:
+                        ordered = ordered_qty.get(item, 0)
+                        recv = received_qty.get(item, 0)
+                        
+                        if ordered > 0:
+                            total_ordered_items += ordered
+                            total_received_items += recv
+                            
+                            if recv < ordered:
+                                shortage_qty = ordered - recv
+                                shortages.append({
+                                    'item_name': item,
+                                    'ordered': ordered,
+                                    'received': recv,
+                                    'shortage': shortage_qty,
+                                    'order_date': order_date,
+                                    'delivery_date': received_date,
+                                    'status': 'PARTIAL' if recv > 0 else 'NOT_DELIVERED'
+                                })
+                                total_shortage_items += shortage_qty
+            
+            # Sort shortages by severity (highest shortage first)
+            shortages.sort(key=lambda x: x['shortage'], reverse=True)
+            
+            return {
+                'location': location,
+                'date_range': f"{start_date} to {end_date}",
+                'days_analyzed': days_back,
+                'total_ordered': total_ordered_items,
+                'total_received': total_received_items,
+                'total_shortage': total_shortage_items,
+                'shortage_percentage': (total_shortage_items / total_ordered_items * 100) if total_ordered_items > 0 else 0,
+                'shortages': shortages,
+                'orders_analyzed': len(orders),
+                'deliveries_analyzed': len(received)
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating shortages: {e}")
+            return {
+                'location': location,
+                'error': str(e),
+                'shortages': []
+            }        
     
     def get_all_items(self, use_cache: bool = True) -> List[InventoryItem]:
         """
@@ -1852,6 +2165,161 @@ class TelegramBot:
         
         self.logger.error(f"Failed to send message to chat {chat_id}")
         return False
+
+    def _save_order_to_notion(self, location: str, summary: Dict[str, Any]):
+        """Save order to Notion for shortage tracking."""
+        try:
+            requests = summary.get("requests", [])
+            if not requests:
+                return False
+            
+            # Build quantities dict
+            quantities = {}
+            for item in requests:
+                item_name = item.get("item_name", "Unknown")
+                qty = item.get("requested_qty", 0)
+                if qty > 0:
+                    quantities[item_name] = qty
+            
+            if not quantities:
+                return False
+            
+            # Save order transaction
+            date = datetime.now().strftime('%Y-%m-%d')
+            success = self.notion.save_order_transaction(
+                location=location,
+                date=date,
+                manager="System Auto-Order",
+                notes=f"Auto-generated order for {summary.get('delivery_date', 'next delivery')}",
+                quantities=quantities
+            )
+            
+            if success:
+                self.logger.info(f"Saved order to Notion: {location}, {len(quantities)} items")
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"Error saving order to Notion: {e}")
+            return False
+
+    # Add new shortage command handler
+    def _handle_shortages(self, message: Dict):
+        """Display shortage analysis for both locations."""
+        chat_id = message["chat"]["id"]
+        
+        parts = message.get("text", "").split()
+        days_back = 7  # Default
+        
+        # Parse optional days parameter
+        if len(parts) > 1:
+            try:
+                days_back = int(parts[1])
+                if days_back < 1 or days_back > 30:
+                    days_back = 7
+            except ValueError:
+                pass
+        
+        try:
+            # Get shortage analysis for both locations
+            avondale_shortages = self.notion.calculate_shortages("Avondale", days_back)
+            commissary_shortages = self.notion.calculate_shortages("Commissary", days_back)
+            
+            # Build message
+            text = (
+                f"📊 <b>SHORTAGE ANALYSIS</b>\n"
+                f"📅 Last {days_back} days • {datetime.now().strftime('%b %d, %Y')}\n"
+                "─────────────────────────────\n\n"
+            )
+            
+            # Avondale section
+            a_shortages = avondale_shortages.get("shortages", [])
+            a_total_shortage = avondale_shortages.get("total_shortage", 0)
+            a_shortage_pct = avondale_shortages.get("shortage_percentage", 0)
+            
+            text += f"🏪 <b>AVONDALE</b>\n"
+            if a_shortages:
+                text += f"⚠️ {len(a_shortages)} items shorted • {a_shortage_pct:.1f}% shortage rate\n\n"
+                
+                for shortage in a_shortages[:10]:  # Show top 10
+                    item = shortage['item_name']
+                    ordered = shortage['ordered']
+                    received = shortage['received']
+                    short = shortage['shortage']
+                    status = shortage['status']
+                    
+                    if status == 'NOT_DELIVERED':
+                        icon = "🚨"
+                    elif shortage['shortage'] > shortage['ordered'] * 0.5:
+                        icon = "⚠️"
+                    else:
+                        icon = "📉"
+                    
+                    text += f"{icon} <b>{item}</b>\n"
+                    text += f"   Ordered: {ordered} • Received: {received} • Short: {short}\n"
+                
+                if len(a_shortages) > 10:
+                    text += f"<i>...and {len(a_shortages) - 10} more items</i>\n"
+            else:
+                text += "✅ No shortages detected\n"
+            
+            text += "\n"
+            
+            # Commissary section  
+            c_shortages = commissary_shortages.get("shortages", [])
+            c_total_shortage = commissary_shortages.get("total_shortage", 0)
+            c_shortage_pct = commissary_shortages.get("shortage_percentage", 0)
+            
+            text += f"🏭 <b>COMMISSARY</b>\n"
+            if c_shortages:
+                text += f"⚠️ {len(c_shortages)} items shorted • {c_shortage_pct:.1f}% shortage rate\n\n"
+                
+                for shortage in c_shortages[:10]:  # Show top 10
+                    item = shortage['item_name']
+                    ordered = shortage['ordered']
+                    received = shortage['received']
+                    short = shortage['shortage']
+                    status = shortage['status']
+                    
+                    if status == 'NOT_DELIVERED':
+                        icon = "🚨"
+                    elif shortage['shortage'] > shortage['ordered'] * 0.5:
+                        icon = "⚠️"
+                    else:
+                        icon = "📉"
+                    
+                    text += f"{icon} <b>{item}</b>\n"
+                    text += f"   Ordered: {ordered} • Received: {received} • Short: {short}\n"
+                
+                if len(c_shortages) > 10:
+                    text += f"<i>...and {len(c_shortages) - 10} more items</i>\n"
+            else:
+                text += "✅ No shortages detected\n"
+            
+            # Summary
+            total_shortages = len(a_shortages) + len(c_shortages)
+            if total_shortages > 0:
+                text += (
+                    f"\n─────────────────────────────\n"
+                    f"📈 <b>SUMMARY</b>\n"
+                    f"• Total shortage events: {total_shortages}\n"
+                    f"• Items affected: {len(set([s['item_name'] for s in a_shortages + c_shortages]))}\n"
+                    f"• Avg shortage rate: {(a_shortage_pct + c_shortage_pct) / 2:.1f}%\n\n"
+                    f"💡 Use /shortages [days] to analyze different periods"
+                )
+            else:
+                text += (
+                    f"\n─────────────────────────────\n"
+                    f"✅ <b>EXCELLENT DELIVERY PERFORMANCE</b>\n"
+                    f"No shortages detected in the last {days_back} days"
+                )
+            
+            self.send_message(chat_id, text)
+            self.logger.info(f"/shortages sent - {total_shortages} shortage events")
+            
+        except Exception as e:
+            self.logger.error(f"/shortages failed: {e}", exc_info=True)
+            self.send_message(chat_id, "⚠️ Unable to analyze shortages. Please try again.")
     
     def _sanitize_html(self, text: str) -> str:
         """Enhanced HTML sanitization for Telegram."""
@@ -2111,6 +2579,7 @@ class TelegramBot:
             "/order_avondale": self._handle_order_avondale,
             "/order_commissary": self._handle_order_commissary,
             "/reassurance": self._handle_reassurance,
+            "/shortages": self._handle_shortages,
             "/status": self._handle_status,
             "/cancel": self._handle_cancel,
             "/adu": self._handle_adu,
@@ -3045,6 +3514,10 @@ class TelegramBot:
         try:
             avondale = self.calc.generate_auto_requests("Avondale")
             commissary = self.calc.generate_auto_requests("Commissary")
+            self._save_order_to_notion("Avondale", avondale)
+            self._save_order_to_notion("Commissary", commissary)
+        
+
             
             text = (
                 "📋 <b>PURCHASE ORDERS</b>\n"
@@ -3107,6 +3580,7 @@ class TelegramBot:
         
         try:
             summary = self.calc.generate_auto_requests("Avondale")
+            self._save_order_to_notion("Avondale", summary)
             delivery = summary.get("delivery_date", "—")
             requests = summary.get("requests", [])
             cycle = summary.get("order_cycle", {})
@@ -3226,6 +3700,8 @@ class TelegramBot:
         
         try:
             summary = self.calc.generate_auto_requests("Commissary")
+            self._save_order_to_notion("Commissary", summary)
+            
             delivery = summary.get("delivery_date", "—")
             requests = summary.get("requests", [])
             cycle = summary.get("order_cycle", {})

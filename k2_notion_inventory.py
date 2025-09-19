@@ -1284,12 +1284,10 @@ class NotionManager:
         return avondale_items + commissary_items
     
     def save_inventory_transaction(self, location: str, entry_type: str, date: str, 
-                                 manager: str, notes: str, quantities: Dict[str, float]) -> bool:
+                                manager: str, notes: str, quantities: Dict[str, float],
+                                image_file_id: Optional[str] = None) -> bool:
         """
-        Save inventory transaction using a single JSON column approach.
-        
-        This elegant solution stores all quantities in one JSON property,
-        eliminating the need to create 19+ individual columns manually.
+        Save inventory transaction with optional image using Telegram file approach.
         
         Args:
             location: Location name
@@ -1298,6 +1296,7 @@ class NotionManager:
             manager: Manager name (becomes page title)
             notes: Optional notes
             quantities: Dict mapping item names to quantities
+            image_file_id: Optional Telegram file ID for product image
             
         Returns:
             bool: True if successful
@@ -1377,6 +1376,31 @@ class NotionManager:
                 ]
             }
             
+            # Add image if provided - using the working approach from communication bot
+            if image_file_id:
+                try:
+                    # Get the Telegram bot token from environment
+                    bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+                    if bot_token:
+                        photo_url = self._get_telegram_photo_url(image_file_id, bot_token)
+                        if photo_url:
+                            properties['Product Image'] = {
+                                'files': [
+                                    {
+                                        'type': 'external',
+                                        'name': f'Delivery Photo - {date}',
+                                        'external': {'url': photo_url}
+                                    }
+                                ]
+                            }
+                            self.logger.info(f"Added product image to inventory transaction")
+                        else:
+                            self.logger.warning(f"Could not process image {image_file_id}")
+                            
+                except Exception as e:
+                    self.logger.error(f"Error processing image: {e}")
+                    # Continue without image rather than failing the entire transaction
+            
             # Create the page
             page_data = {
                 'parent': {
@@ -1388,7 +1412,8 @@ class NotionManager:
             response = self._make_request('POST', '/pages', page_data)
             
             if response:
-                self.logger.info(f"Saved inventory transaction: {title}")
+                image_note = " with image" if image_file_id else ""
+                self.logger.info(f"Saved inventory transaction: {title}{image_note}")
                 self.logger.info(f"Items recorded: {len([q for q in quantities.values() if q > 0])}")
                 return True
             else:
@@ -1541,6 +1566,41 @@ class NotionManager:
         self._items_cache.clear()
         self._cache_timestamp = None
         self.logger.debug("Items cache invalidated")
+
+    def _get_telegram_photo_url(self, file_id: str, bot_token: str) -> Optional[str]:
+        """
+        Get Telegram photo URL using the same approach as communication bot.
+        
+        Args:
+            file_id: Telegram file ID
+            bot_token: Telegram bot token
+            
+        Returns:
+            Optional[str]: Photo URL that Notion can cache
+        """
+        try:
+            # Get file info from Telegram
+            file_response = requests.get(
+                f"https://api.telegram.org/bot{bot_token}/getFile",
+                params={'file_id': file_id}
+            )
+            
+            if not file_response.ok:
+                return None
+            
+            file_info = file_response.json()
+            if not file_info.get('ok'):
+                return None
+            
+            file_path = file_info['result']['file_path']
+            
+            # Return the download URL - Notion will cache it when we create the page
+            download_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+            return download_url
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get photo URL: {e}")
+            return None
 
 # ===== BUSINESS CALCULATIONS ENGINE =====
 
@@ -2492,11 +2552,9 @@ class TelegramBot:
 
     # ===== UPDATE PROCESSING =====
     
-
-
     def _process_update(self, update: Dict):
         """
-        Process update with proper routing for entry wizard input.
+        Process update with proper routing for entry wizard input including photos.
         """
         try:
             # Handle callback queries
@@ -2514,45 +2572,53 @@ class TelegramBot:
             
             # Handle messages
             message = update.get("message")
-            if not message or "text" not in message:
-                return
-            
-            text = sanitize_user_input(message.get("text", ""))
-            if not text:
+            if not message:
                 return
             
             chat_id = message["chat"]["id"]
             user_id = message["from"]["id"]
             
             # IMPORTANT: Check for entry session BEFORE command processing
-            # This allows number input to work during entry
+            # This allows number input AND photo input to work during entry
             if hasattr(self, 'entry_handler') and user_id in self.entry_handler.sessions:
                 session = self.entry_handler.sessions[user_id]
                 if not session.is_expired():
-                    # Let entry handler process the text (including numbers)
-                    self.entry_handler.handle_text_input(message, session)
-                    return
+                    # Handle photo messages - same approach as communication bot
+                    if 'photo' in message:
+                        if session.mode == "received" and session.current_step == "image":
+                            self.entry_handler.handle_photo_input(message, session)
+                        return
+                    # Handle text input (including numbers)
+                    elif 'text' in message:
+                        self.entry_handler.handle_text_input(message, session)
+                        return
             
-            # Handle commands
-            if text.startswith("/"):
-                command = text.split()[0].lower()
-                
-                # Check rate limit
-                if not self._check_rate_limit(user_id, command):
-                    self.send_message(chat_id, 
-                                    "⏳ Too many commands. Please wait a moment.")
+            # Handle text messages and commands
+            if "text" in message:
+                text = sanitize_user_input(message.get("text", ""))
+                if not text:
                     return
                 
-                # Route command
-                self._route_command(message, command)
-                return
-            
-            # Handle old-style conversation input (if still in use)
-            with self.conversation_lock:
-                if user_id in self.conversations:
-                    state = self.conversations[user_id]
-                    self._handle_conversation_input_safe(message, state)
+                # Handle commands
+                if text.startswith("/"):
+                    command = text.split()[0].lower()
+                    
+                    # Check rate limit
+                    if not self._check_rate_limit(user_id, command):
+                        self.send_message(chat_id, 
+                                        "⏳ Too many commands. Please wait a moment.")
+                        return
+                    
+                    # Route command
+                    self._route_command(message, command)
                     return
+                
+                # Handle old-style conversation input (if still in use)
+                with self.conversation_lock:
+                    if user_id in self.conversations:
+                        state = self.conversations[user_id]
+                        self._handle_conversation_input_safe(message, state)
+                        return
             
             # No active session or conversation
             self.send_message(chat_id, 
@@ -2568,6 +2634,7 @@ class TelegramBot:
             except:
                 pass
 
+    
     def _route_command(self, message: Dict, command: str):
         """Route commands to appropriate handlers."""
         handlers = {
@@ -4031,6 +4098,8 @@ class EntrySession:
     last_message_id: Optional[int] = None
     manager_name: str = "Manager"
     notes: str = ""
+    image_file_id: Optional[str] = None  # Telegram file ID for product image
+    current_step: str = "items"  # Track if we're on items or image step
     
     def is_expired(self) -> bool:
         """Check if session has expired."""
@@ -4178,10 +4247,15 @@ class EnhancedEntryHandler:
             self._handle_submit(chat_id, user_id)
         elif data == "entry_resume_items":
             self._resume_items(chat_id, user_id)
+        elif data == "entry_skip_image":
+            session = self.sessions.get(user_id)
+            if session and session.current_step == "image":
+                session.current_step = "review"
+                self._handle_done(chat_id, user_id)
 
     def handle_text_input(self, message: Dict, session: EntrySession):
         """
-        Handle text input for quantity entry - FIXED to accept numbers.
+        Handle text input for quantity entry and image flow.
         """
         text = message.get("text", "").strip()
         chat_id = session.chat_id
@@ -4203,7 +4277,20 @@ class EnhancedEntryHandler:
             self._handle_cancel(chat_id, session.user_id)
             return
         
-        # Try to parse as number
+        # Check if we're in image step
+        if session.current_step == "image":
+            if text.lower() in ["skip", "skip image"]:
+                session.current_step = "review"
+                self._handle_done(chat_id, session.user_id)
+            else:
+                self.bot.send_message(
+                    chat_id,
+                    "📷 Please send a photo or use the 'Skip Image' button."
+                )
+                self._show_image_request(session)
+            return
+        
+        # Try to parse as number for item quantities
         try:
             quantity = float(text)
             
@@ -4233,9 +4320,14 @@ class EnhancedEntryHandler:
             if item:
                 self.logger.info(f"Entry: {item['name']} = {quantity}")
             
-            # Show next item or complete
+            # Show next item or move to next step
             if session.index >= len(session.items):
-                self._handle_done(chat_id, session.user_id)
+                # Check if this is a received delivery that needs image
+                if session.mode == "received":
+                    session.current_step = "image"
+                    self._show_image_request(session)
+                else:
+                    self._handle_done(chat_id, session.user_id)
             else:
                 self._show_current_item(session)
                 
@@ -4247,6 +4339,8 @@ class EnhancedEntryHandler:
                 "Or use the buttons: Skip, Done, Cancel"
             )
             self._show_current_item(session)
+
+
     
     def _handle_location_selection(self, chat_id: int, user_id: int, location: str):
         """Handle location selection."""
@@ -4453,71 +4547,75 @@ class EnhancedEntryHandler:
         self.bot.send_message(chat_id, text, reply_markup=keyboard)
     
     def _handle_submit(self, chat_id: int, user_id: int):
-        """Submit the entry to Notion."""
-        session = self.sessions.get(user_id)
-        if not session:
-            self.bot.send_message(chat_id, "No active session.")
-            return
+    """Submit the entry to Notion with optional image."""
+    session = self.sessions.get(user_id)
+    if not session:
+        self.bot.send_message(chat_id, "No active session.")
+        return
+    
+    # Prepare data for saving
+    quantities = {
+        name: (qty if qty is not None else 0.0)
+        for name, qty in session.answers.items()
+    }
+    
+    date = datetime.now().strftime('%Y-%m-%d')
+    
+    # Save to Notion with image file ID (not processed data)
+    try:
+        success = self.notion.save_inventory_transaction(
+            location=session.location,
+            entry_type=session.mode,
+            date=date,
+            manager=session.manager_name,
+            notes=session.notes,
+            quantities=quantities,
+            image_file_id=session.image_file_id  # Pass the Telegram file ID
+        )
         
-        # Prepare data for saving
-        quantities = {
-            name: (qty if qty is not None else 0.0)
-            for name, qty in session.answers.items()
-        }
-        
-        date = datetime.now().strftime('%Y-%m-%d')
-        
-        # Save to Notion
-        try:
-            success = self.notion.save_inventory_transaction(
-                location=session.location,
-                entry_type=session.mode,
-                date=date,
-                manager=session.manager_name,
-                notes=session.notes,
-                quantities=quantities
-            )
+        if success:
+            # Success message
+            mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
+            items_count = session.get_answered_count()
+            total_qty = session.get_total_quantity()
+            image_note = " with image" if session.image_file_id else ""
             
-            if success:
-                # Success message
-                mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
-                items_count = session.get_answered_count()
-                total_qty = session.get_total_quantity()
-                
-                self.bot.send_message(
-                    chat_id,
-                    f"✅ <b>Entry Saved Successfully</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Location: {session.location}\n"
-                    f"Type: {mode_text}\n"
-                    f"Date: {date}\n"
-                    f"Items: {items_count}\n"
-                    f"Total: {total_qty:.1f} units\n\n"
-                    f"Use /info to see updated status"
-                )
-                
-                # Log for audit
-                self.logger.info(
-                    f"Entry submitted: {session.location} {mode_text} "
-                    f"by user {user_id}, {items_count} items, total {total_qty:.1f}"
-                )
-            else:
-                self.bot.send_message(
-                    chat_id,
-                    "⚠️ Failed to save to Notion. Please try again."
-                )
-                return
-                
-        except Exception as e:
-            self.logger.error(f"Error submitting entry: {e}", exc_info=True)
             self.bot.send_message(
                 chat_id,
-                "⚠️ Error saving entry. Please contact support."
+                f"✅ <b>Entry Saved Successfully</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Location: {session.location}\n"
+                f"Type: {mode_text}\n"
+                f"Date: {date}\n"
+                f"Items: {items_count}\n"
+                f"Total: {total_qty:.1f} units{image_note}\n\n"
+                f"Use /info to see updated status"
+            )
+            
+            # Log for audit
+            self.logger.info(
+                f"Entry submitted: {session.location} {mode_text} "
+                f"by user {user_id}, {items_count} items, total {total_qty:.1f}{image_note}"
+            )
+        else:
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Failed to save to Notion. Please try again."
             )
             return
-        
-        # Clean up session
-        self._delete_session(user_id)
+            
+    except Exception as e:
+        self.logger.error(f"Error submitting entry: {e}", exc_info=True)
+        self.bot.send_message(
+            chat_id,
+            "⚠️ Error saving entry. Please contact support."
+        )
+        return
+    
+    # Clean up session
+    self._delete_session(user_id)
+
+
     
     def _resume_items(self, chat_id: int, user_id: int):
         """Resume item entry from review screen."""
@@ -4587,6 +4685,67 @@ class EnhancedEntryHandler:
         
         if expired_users:
             self.logger.info(f"Cleaned up {len(expired_users)} expired entry sessions")
+
+    def handle_photo_input(self, message: Dict, session: EntrySession):
+        """
+        Handle photo input for received deliveries.
+        
+        Args:
+            message: Telegram message with photo
+            session: Current entry session
+        """
+        chat_id = session.chat_id
+        
+        try:
+            # Get the largest photo (best quality) - same as communication bot
+            photos = message.get('photo', [])
+            if not photos:
+                self.bot.send_message(chat_id, "No photo received. Please try again.")
+                self._show_image_request(session)
+                return
+            
+            # Get the highest resolution photo
+            largest_photo = max(photos, key=lambda p: p.get('file_size', 0))
+            file_id = largest_photo['file_id']
+            
+            # Store the file ID for later processing
+            session.image_file_id = file_id
+            session.current_step = "review"
+            
+            self.bot.send_message(
+                chat_id,
+                "✅ Photo received successfully!\n"
+                "Moving to review..."
+            )
+            
+            # Move to review
+            self._handle_done(chat_id, session.user_id)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling photo input: {e}")
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Error processing photo. You can skip this step or try again."
+            )
+            self._show_image_request(session)
+
+    def _show_image_request(self, session: EntrySession):
+        """Show image request prompt for received deliveries."""
+        keyboard = self._create_keyboard([
+            [("⏭️ Skip Image", "entry_skip_image")],
+            [("✅ Done", "entry_done"), ("❌ Cancel", "entry_cancel")]
+        ])
+        
+        self.bot.send_message(
+            session.chat_id,
+            "📷 <b>Product Image</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send a photo of the received delivery.\n\n"
+            "This helps with quality tracking and verification.\n\n"
+            "You can also skip this step if no photo is available.",
+            reply_markup=keyboard
+        )
+
 
 
 # ===== MAIN APPLICATION =====

@@ -4547,73 +4547,73 @@ class EnhancedEntryHandler:
         self.bot.send_message(chat_id, text, reply_markup=keyboard)
     
     def _handle_submit(self, chat_id: int, user_id: int):
-    """Submit the entry to Notion with optional image."""
-    session = self.sessions.get(user_id)
-    if not session:
-        self.bot.send_message(chat_id, "No active session.")
-        return
-    
-    # Prepare data for saving
-    quantities = {
-        name: (qty if qty is not None else 0.0)
-        for name, qty in session.answers.items()
-    }
-    
-    date = datetime.now().strftime('%Y-%m-%d')
-    
-    # Save to Notion with image file ID (not processed data)
-    try:
-        success = self.notion.save_inventory_transaction(
-            location=session.location,
-            entry_type=session.mode,
-            date=date,
-            manager=session.manager_name,
-            notes=session.notes,
-            quantities=quantities,
-            image_file_id=session.image_file_id  # Pass the Telegram file ID
-        )
+        """Submit the entry to Notion with optional image."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "No active session.")
+            return
         
-        if success:
-            # Success message
-            mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
-            items_count = session.get_answered_count()
-            total_qty = session.get_total_quantity()
-            image_note = " with image" if session.image_file_id else ""
-            
-            self.bot.send_message(
-                chat_id,
-                f"✅ <b>Entry Saved Successfully</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Location: {session.location}\n"
-                f"Type: {mode_text}\n"
-                f"Date: {date}\n"
-                f"Items: {items_count}\n"
-                f"Total: {total_qty:.1f} units{image_note}\n\n"
-                f"Use /info to see updated status"
+        # Prepare data for saving
+        quantities = {
+            name: (qty if qty is not None else 0.0)
+            for name, qty in session.answers.items()
+        }
+        
+        date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Save to Notion with image file ID (not processed data)
+        try:
+            success = self.notion.save_inventory_transaction(
+                location=session.location,
+                entry_type=session.mode,
+                date=date,
+                manager=session.manager_name,
+                notes=session.notes,
+                quantities=quantities,
+                image_file_id=session.image_file_id  # Pass the Telegram file ID
             )
             
-            # Log for audit
-            self.logger.info(
-                f"Entry submitted: {session.location} {mode_text} "
-                f"by user {user_id}, {items_count} items, total {total_qty:.1f}{image_note}"
-            )
-        else:
+            if success:
+                # Success message
+                mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
+                items_count = session.get_answered_count()
+                total_qty = session.get_total_quantity()
+                image_note = " with image" if session.image_file_id else ""
+                
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ <b>Entry Saved Successfully</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Location: {session.location}\n"
+                    f"Type: {mode_text}\n"
+                    f"Date: {date}\n"
+                    f"Items: {items_count}\n"
+                    f"Total: {total_qty:.1f} units{image_note}\n\n"
+                    f"Use /info to see updated status"
+                )
+                
+                # Log for audit
+                self.logger.info(
+                    f"Entry submitted: {session.location} {mode_text} "
+                    f"by user {user_id}, {items_count} items, total {total_qty:.1f}{image_note}"
+                )
+            else:
+                self.bot.send_message(
+                    chat_id,
+                    "⚠️ Failed to save to Notion. Please try again."
+                )
+                return
+                
+        except Exception as e:
+            self.logger.error(f"Error submitting entry: {e}", exc_info=True)
             self.bot.send_message(
                 chat_id,
-                "⚠️ Failed to save to Notion. Please try again."
+                "⚠️ Error saving entry. Please contact support."
             )
             return
-            
-    except Exception as e:
-        self.logger.error(f"Error submitting entry: {e}", exc_info=True)
-        self.bot.send_message(
-            chat_id,
-            "⚠️ Error saving entry. Please contact support."
-        )
-        return
-    
-    # Clean up session
-    self._delete_session(user_id)
+        
+        # Clean up session
+        self._delete_session(user_id)
 
 
     

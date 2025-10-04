@@ -15,9 +15,9 @@ Key Features:
 - Location-aware business logic
 - Weekly and monthly ADU analysis
 
-Author: Dorei Satō
+Author: Ladios Satō
 License: Proprietary  
-Version: 2.0.0
+Version: 3.0.0
 """
 
 import asyncio
@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from urllib.parse import quote
 
 import requests
-SYSTEM_VERSION = "2.0.0"  # Make sure this is defined at module level
+SYSTEM_VERSION = "3.0.0"  # Make sure this is defined at module level
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -107,7 +107,7 @@ def get_time_in_timezone(timezone_str: str = None) -> datetime:
 # ===== CONFIGURATION AND CONSTANTS =====
 
 # System Configuration
-SYSTEM_VERSION = "2.0.0"
+SYSTEM_VERSION = "3.0.0"
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-12s | %(funcName)-20s | %(lineno)d | %(message)s"
 MAX_MEMORY_MB = 512
 MAX_LOG_SIZE_MB = 50
@@ -3048,7 +3048,7 @@ class TelegramBot:
             text = (
                 "🚀 <b>K2 Restaurant Inventory System</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Version 2.0.0 • Status: {system_status}\n\n"
+                f"Version 3.0.0 • Status: {system_status}\n\n"
                 
                 "📊 <b>Core Commands</b>\n"
                 "├ /entry — Record inventory counts\n"

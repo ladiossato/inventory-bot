@@ -3799,26 +3799,150 @@ class TelegramBot:
         except Exception as e:
             self.logger.error(f"/order_commissary delegation failed | error={e}", exc_info=True)
             self.send_message(chat_id, "⚠️ Unable to start order flow. Please try /order or contact support.")
+    
+    def _compute_item_coverage_status(self, item_name: str, adu: float, on_hand: float, 
+                                       coverage_days: float, unit_type: str) -> Dict[str, Any]:
+        """
+        Compute coverage status and recommendation for a single item.
+        
+        Formula:
+        - needed = ADU × coverage_days
+        - critical = OnHand < needed
+        - recommended_order = max(0, ceil(needed - OnHand))
+        
+        Args:
+            item_name: Item name
+            adu: Average daily usage
+            on_hand: Current on-hand quantity
+            coverage_days: Days to cover
+            unit_type: Unit type for display
+            
+        Returns:
+            Dict with: needed, critical, recommended_order, days_of_stock
+            
+        Logs: all inputs and computed values
+        """
+        import math
+        
+        needed = adu * coverage_days
+        critical = on_hand < needed
+        recommended_raw = needed - on_hand
+        recommended_order = max(0, math.ceil(recommended_raw))
+        
+        # Calculate days of stock remaining
+        days_of_stock = (on_hand / adu) if adu > 0 else float('inf')
+        
+        result = {
+            'item_name': item_name,
+            'adu': adu,
+            'on_hand': on_hand,
+            'coverage_days': coverage_days,
+            'needed': needed,
+            'critical': critical,
+            'recommended_order': recommended_order,
+            'days_of_stock': days_of_stock,
+            'unit_type': unit_type
+        }
+        
+        self.logger.debug(
+            f"Coverage status | item={item_name} adu={adu:.2f} on_hand={on_hand:.1f} "
+            f"coverage_days={coverage_days} needed={needed:.1f} critical={critical} rec={recommended_order}"
+        )
+        
+        return result
 
     def _handle_reassurance(self, message: Dict):
         """
-        Daily risk assessment with FIXED consumption math.
-        Shows which items won't make it to delivery based on burn-down.
+        Daily risk assessment with correct coverage math.
+        
+        For each vendor, evaluates items using:
+        - On-Hand from Notion (latest entry)
+        - ADU from Notion catalog
+        - Coverage days from vendor config
+        - Critical if: OnHand < (ADU × coverage_days)
+        - Recommended order = ceil(ADU × coverage_days - OnHand)
+        
+        Logs: Notion queries, item evaluations, critical count
         """
         chat_id = message["chat"]["id"]
         
         try:
-            avondale = self.calc.calculate_location_summary("Avondale")
-            commissary = self.calc.calculate_location_summary("Commissary")
-            
-            # Get critical items that need immediate attention
-            a_critical = [item for item in avondale.get("items", []) 
-                        if item.get("status") == "RED"]
-            c_critical = [item for item in commissary.get("items", []) 
-                        if item.get("status") == "RED"]
-            total_critical = len(a_critical) + len(c_critical)
-            
             now = get_time_in_timezone(BUSINESS_TIMEZONE)
+            
+            self.logger.info(f"/reassurance command | chat={chat_id} time={now.strftime('%Y-%m-%d %H:%M')}")
+            
+            # Define coverage days per vendor
+            vendor_coverage = {
+                'Avondale': 3.5,  # Average of Monday (3.0) and Thursday (4.0)
+                'Commissary': 2.33  # Average of Tue/Thu (2.0) and Sat (3.0)
+            }
+            
+            all_critical_items = []
+            vendor_summaries = {}
+            
+            # Evaluate each vendor
+            for vendor in ['Avondale', 'Commissary']:
+                coverage_days = vendor_coverage.get(vendor, 3.0)
+                
+                self.logger.info(f"Evaluating {vendor} | coverage_days={coverage_days}")
+                
+                # Get items from Notion
+                try:
+                    items = self.notion.get_items_for_location(vendor, use_cache=False)
+                    self.logger.info(f"{vendor} items loaded | count={len(items)}")
+                except Exception as e:
+                    self.logger.error(f"Failed to load items for {vendor} | error={e}", exc_info=True)
+                    items = []
+                
+                # Get latest On-Hand inventory
+                try:
+                    inventory_data = self.notion.get_latest_inventory(vendor, entry_type="on_hand")
+                    self.logger.info(f"{vendor} inventory loaded | items_with_qty={len(inventory_data)}")
+                except Exception as e:
+                    self.logger.error(f"Failed to load inventory for {vendor} | error={e}", exc_info=True)
+                    inventory_data = {}
+                
+                # Evaluate each item
+                critical_items = []
+                ok_items = []
+                
+                for item in items:
+                    on_hand = inventory_data.get(item.name, 0.0)
+                    
+                    # Log missing data
+                    if item.name not in inventory_data:
+                        self.logger.warning(f"Missing on-hand data | vendor={vendor} item={item.name} | defaulting to 0.0")
+                    
+                    # Compute coverage status
+                    status = self._compute_item_coverage_status(
+                        item_name=item.name,
+                        adu=item.adu,
+                        on_hand=on_hand,
+                        coverage_days=coverage_days,
+                        unit_type=item.unit_type
+                    )
+                    
+                    if status['critical']:
+                        critical_items.append(status)
+                    else:
+                        ok_items.append(status)
+                
+                vendor_summaries[vendor] = {
+                    'coverage_days': coverage_days,
+                    'total_items': len(items),
+                    'critical_count': len(critical_items),
+                    'ok_count': len(ok_items),
+                    'critical_items': critical_items
+                }
+                
+                all_critical_items.extend(critical_items)
+                
+                self.logger.info(
+                    f"{vendor} evaluated | total={len(items)} critical={len(critical_items)} ok={len(ok_items)}"
+                )
+            
+            # Build message
+            total_critical = len(all_critical_items)
             
             if total_critical == 0:
                 # All clear message
@@ -3833,27 +3957,18 @@ class TelegramBot:
                     "📊 <b>Location Status</b>\n"
                 )
                 
-                # Avondale status
-                a_cycle = avondale.get("order_cycle", {})
-                text += (
-                    f"├ 🏪 Avondale: {avondale['status_counts']['GREEN']} items OK\n"
-                    f"│  Next delivery: {avondale['delivery_date']}\n"
-                    f"│  Coverage window: {a_cycle.get('days_post', 0)} days\n"
-                )
-                
-                # Commissary status
-                c_cycle = commissary.get("order_cycle", {})
-                text += (
-                    f"├ 🏭 Commissary: {commissary['status_counts']['GREEN']} items OK\n"
-                    f"│  Next delivery: {commissary['delivery_date']}\n"
-                    f"│  Coverage window: {c_cycle.get('days_post', 0)} days\n"
-                )
+                for vendor in ['Avondale', 'Commissary']:
+                    summary = vendor_summaries[vendor]
+                    icon = "🏪" if vendor == "Avondale" else "🏭"
+                    text += (
+                        f"├ {icon} {vendor}: {summary['ok_count']} items OK\n"
+                        f"│  Coverage: {summary['coverage_days']:.1f} days\n"
+                    )
                 
                 text += (
                     f"└ Total Coverage: 100%\n\n"
                     
-                    "✅ All levels sufficient through delivery\n"
-                    "✅ Orders sized for post-delivery needs\n"
+                    "✅ All inventory levels sufficient\n"
                     "✅ No immediate action required\n\n"
                     
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3870,47 +3985,29 @@ class TelegramBot:
                     f"{total_critical} item{'s' if total_critical != 1 else ''} need ordering\n\n"
                 )
                 
-                if a_critical:
-                    a_cycle = avondale.get("order_cycle", {})
-                    text += f"🏪 <b>AVONDALE ({len(a_critical)} critical)</b>\n"
-                    text += f"Delivery: {avondale['delivery_date']} • "
-                    text += f"Coverage: {a_cycle.get('days_post', 0)} days\n\n"
+                # Show critical items by vendor
+                for vendor in ['Avondale', 'Commissary']:
+                    summary = vendor_summaries[vendor]
+                    critical_items = summary['critical_items']
                     
-                    for item in sorted(a_critical, 
-                                    key=lambda x: x.get('oh_at_delivery', 0))[:5]:
-                        oh_delivery = item.get('oh_at_delivery', 0)
-                        need = item.get('consumption_need', 0)
-                        order = item.get('required_order_rounded', 0)
+                    if critical_items:
+                        icon = "🏪" if vendor == "Avondale" else "🏭"
+                        text += f"{icon} <b>{vendor.upper()} ({len(critical_items)} critical)</b>\n"
+                        text += f"Coverage requirement: {summary['coverage_days']:.1f} days\n\n"
                         
-                        text += f"🔴 <b>{item['item_name']}</b>\n"
-                        text += f"   At delivery: {oh_delivery:.1f} {item['unit_type']}\n"
-                        text += f"   Need: {need:.1f} • Order: {order}\n"
-                    
-                    if len(a_critical) > 5:
-                        text += f"<i>...plus {len(a_critical) - 5} more</i>\n"
-                    text += "\n"
-                
-                if c_critical:
-                    c_cycle = commissary.get("order_cycle", {})
-                    text += f"🏭 <b>COMMISSARY ({len(c_critical)} critical)</b>\n"
-                    text += f"Delivery: {commissary['delivery_date']} • "
-                    text += f"Coverage: {c_cycle.get('days_post', 0)} days\n\n"
-                    
-                    for item in sorted(c_critical, 
-                                    key=lambda x: x.get('oh_at_delivery', 0))[:5]:
-                        oh_delivery = item.get('oh_at_delivery', 0)
-                        need = item.get('consumption_need', 0)
-                        order = item.get('required_order_rounded', 0)
+                        # Sort by severity (lowest days of stock first)
+                        for item in sorted(critical_items, key=lambda x: x['days_of_stock'])[:5]:
+                            text += f"🔴 <b>{item['item_name']}</b>\n"
+                            text += f"   On-Hand: {item['on_hand']:.1f} {item['unit_type']}\n"
+                            text += f"   Need: {item['needed']:.1f} • Order: {item['recommended_order']}\n"
+                            text += f"   Days remaining: {item['days_of_stock']:.1f}\n"
                         
-                        text += f"🔴 <b>{item['item_name']}</b>\n"
-                        text += f"   At delivery: {oh_delivery:.1f} {item['unit_type']}\n"
-                        text += f"   Need: {need:.1f} • Order: {order}\n"
-                    
-                    if len(c_critical) > 5:
-                        text += f"<i>...plus {len(c_critical) - 5} more</i>\n"
+                        if len(critical_items) > 5:
+                            text += f"<i>...plus {len(critical_items) - 5} more</i>\n"
+                        text += "\n"
                 
                 text += (
-                    "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     "⚠️ <b>IMMEDIATE ACTION NEEDED</b>\n"
                     "These items need ordering NOW\n\n"
                     "📞 Contact supplier immediately\n"
@@ -3925,7 +4022,7 @@ class TelegramBot:
             
             # Always send to requesting user
             self.send_message(chat_id, text)
-            self.logger.info(f"/reassurance sent - {total_critical} critical items")
+            self.logger.info(f"/reassurance sent | total_critical={total_critical} avondale={vendor_summaries['Avondale']['critical_count']} commissary={vendor_summaries['Commissary']['critical_count']}")
             
         except Exception as e:
             self.logger.error(f"/reassurance failed: {e}", exc_info=True)
@@ -6202,28 +6299,31 @@ class OrderFlowHandler:
     def _show_review_with_tag(self, session: OrderSession):
         """
         Display Review screen with current person tag (if any).
-        Called after person tag is captured or updated.
+        Uses selected delivery date from calendar picker.
         
-        Logs: review display with tag.
+        Logs: review display with tag, delivery date used.
         """
         self.logger.info(f"[{session.session_token}] Displaying Review with tag | tag='{session.person_tag}'")
         
-        # Get delivery date
-        try:
-            summary = self.calc.generate_auto_requests(session.vendor)
-            delivery_date = summary.get("delivery_date", "—")
-        except Exception as e:
-            self.logger.error(f"[{session.session_token}] Failed to get delivery date | error={e}", exc_info=True)
-            delivery_date = "—"
+        # Use the delivery date selected in calendar picker
+        delivery_date = session.delivery_date if session.delivery_date else "—"
+        
+        self.logger.info(f"[{session.session_token}] Review using delivery_date | date={delivery_date}")
         
         # Build review text
         text = (
             f"📋 <b>Review Order</b>\n"
             f"────────────────────────────\n"
             f"Vendor: <b>{session.vendor}</b>\n"
-            f"Order Date: <b>{session.order_date}</b>\n"
-            f"Delivery: <b>{delivery_date}</b>\n\n"
+            f"Delivery: <b>{delivery_date}</b>\n"
         )
+        
+        # Show consumption window if available
+        if session.next_delivery_date and session.consumption_days:
+            text += f"Next delivery: <b>{session.next_delivery_date}</b>\n"
+            text += f"Coverage: <b>{session.consumption_days} days</b>\n"
+        
+        text += "\n"
         
         entered_items = []
         for item in session.items:
@@ -6251,6 +6351,8 @@ class OrderFlowHandler:
             [("✅ Confirm", "order_confirm"), ("🔙 Back to Items", "order_review_back")],
             [("❌ Cancel", "order_cancel")]
         ])
+        
+        self.logger.info(f"[{session.session_token}] Review message built | delivery={delivery_date} items={len(entered_items)} text_len={len(text)}")
         
         self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
 

@@ -1363,6 +1363,114 @@ class NotionManager:
         
         return avondale_items + commissary_items
     
+    def get_locations(self, use_cache: bool = True) -> List[str]:
+        """
+        Retrieve all unique location names from Items Master database.
+        
+        Queries the Items Master for distinct Location values and caches
+        the result for 5 minutes to minimize API calls. This is the single
+        source of truth for all location/vendor names in the system.
+        
+        Args:
+            use_cache: Whether to use cached locations if available
+            
+        Returns:
+            List[str]: Sorted list of unique location names
+            
+        Logs: cache hit/miss, query execution, location count, cache update
+        """
+        cache_key = "_locations_list"
+        cache_ttl = 300  # 5 minutes
+        
+        # Check cache first
+        if use_cache and hasattr(self, '_locations_cache_timestamp'):
+            cache_age = time.time() - self._locations_cache_timestamp
+            if cache_age < cache_ttl and cache_key in self.__dict__:
+                cached_locations = getattr(self, cache_key, [])
+                self.logger.debug(f"Locations cache hit | age={cache_age:.1f}s count={len(cached_locations)}")
+                return cached_locations
+            else:
+                self.logger.debug(f"Locations cache expired | age={cache_age:.1f}s")
+        
+        # Cache miss - query Notion
+        self.logger.info(f"Querying Notion for unique locations | db={self.items_db_id[:8]}...")
+        
+        try:
+            start_time = time.time()
+            
+            # Query all items to extract locations
+            # Note: Notion API doesn't have native DISTINCT, so we fetch all and deduplicate
+            query = {
+                'page_size': 100,  # Max page size
+                'filter': {
+                    'property': 'Active',
+                    'checkbox': {
+                        'equals': True
+                    }
+                }
+            }
+            
+            locations_set = set()
+            has_more = True
+            next_cursor = None
+            page_count = 0
+            
+            # Paginate through all results
+            while has_more:
+                page_count += 1
+                if next_cursor:
+                    query['start_cursor'] = next_cursor
+                
+                response = self._make_request('POST', f'/databases/{self.items_db_id}/query', query)
+                
+                if not response:
+                    self.logger.error(f"Failed to query locations | page={page_count}")
+                    # Return cached value if available, otherwise empty
+                    return getattr(self, cache_key, [])
+                
+                # Extract locations from this page
+                for page in response.get('results', []):
+                    props = page.get('properties', {})
+                    location_prop = props.get('Location', {})
+                    location_select = location_prop.get('select', {})
+                    location_name = location_select.get('name')
+                    
+                    if location_name:
+                        locations_set.add(location_name)
+                        self.logger.debug(f"Found location | name='{location_name}' page_id={page.get('id', 'unknown')[:8]}...")
+                
+                # Check for more pages
+                has_more = response.get('has_more', False)
+                next_cursor = response.get('next_cursor')
+                
+                self.logger.debug(f"Locations query page complete | page={page_count} has_more={has_more} found_so_far={len(locations_set)}")
+            
+            # Sort locations alphabetically for consistent UI
+            locations_list = sorted(list(locations_set))
+            
+            duration_ms = (time.time() - start_time) * 1000
+            self.logger.info(f"Locations query complete | count={len(locations_list)} pages={page_count} duration={duration_ms:.2f}ms")
+            
+            if locations_list:
+                self.logger.info(f"Discovered locations: {', '.join(locations_list)}")
+            else:
+                self.logger.warning("No locations found in Items Master database")
+            
+            # Update cache
+            setattr(self, cache_key, locations_list)
+            self._locations_cache_timestamp = time.time()
+            self.logger.debug(f"Locations cache updated | ttl={cache_ttl}s")
+            
+            return locations_list
+            
+        except Exception as e:
+            self.logger.error(f"Error retrieving locations from Notion | error={e}", exc_info=True)
+            # Return cached value if available, otherwise empty list
+            cached = getattr(self, cache_key, [])
+            if cached:
+                self.logger.warning(f"Returning stale cached locations due to error | count={len(cached)}")
+            return cached
+    
     def save_inventory_transaction(self, location: str, entry_type: str, date: str, 
                                 manager: str, notes: str, quantities: Dict[str, float],
                                 image_file_id: Optional[str] = None) -> bool:
@@ -4259,30 +4367,68 @@ class EnhancedEntryHandler:
     
     def _start_vendor_selection(self, chat_id: int, user_id: int, message: Dict = None):
         """
-        Prompt user to select vendor (Avondale or Commissary).
-        Store message for later display name extraction.
+        Prompt user to select location from dynamically discovered list.
+        Uses Notion Items Master as single source of truth for locations.
         
-        Logs: vendor selection prompt.
+        Args:
+            chat_id: Telegram chat ID
+            user_id: Telegram user ID
+            message: Optional message object for display name extraction
+            
+        Logs: location discovery, button generation, prompt sent
         """
-        self.logger.info(f"Prompting vendor selection for entry | user={user_id}")
+        self.logger.info(f"Prompting location selection for entry | user={user_id}")
         
         # Store message for later display name extraction
         if message:
             self._temp_messages[user_id] = message
         
-        keyboard = self._create_keyboard([
-            [("🏪 Avondale", "entry_vendor|Avondale")],
-            [("🏭 Commissary", "entry_vendor|Commissary")],
-            [("❌ Cancel", "entry_cancel")]
-        ])
-        
-        self.bot.send_message(
-            chat_id,
-            "📋 <b>Inventory Entry</b>\n"
-            "────────────────────────────\n"
-            "Select location:",
-            reply_markup=keyboard
-        )
+        # Discover available locations from Notion
+        try:
+            locations = self.notion.get_locations(use_cache=True)
+            self.logger.info(f"Locations discovered for entry menu | count={len(locations)} locations={locations}")
+            
+            if not locations:
+                self.logger.error("No locations available for entry | cannot build menu")
+                self.bot.send_message(
+                    chat_id,
+                    "⚠️ <b>Configuration Error</b>\n"
+                    "────────────────────────────\n"
+                    "No locations found in Items Master.\n\n"
+                    "Please add items with Location property to Notion."
+                )
+                return
+            
+            # Build dynamic location buttons
+            location_buttons = []
+            for location in locations:
+                # Simple prefix for location buttons
+                button_text = f"📍 {location}"
+                callback_data = f"entry_vendor|{location}"
+                location_buttons.append([(button_text, callback_data)])
+                self.logger.debug(f"Built location button | text='{button_text}' callback='{callback_data}'")
+            
+            # Add cancel button
+            location_buttons.append([("❌ Cancel", "entry_cancel")])
+            
+            keyboard = self._create_keyboard(location_buttons)
+            
+            self.bot.send_message(
+                chat_id,
+                "📋 <b>Inventory Entry</b>\n"
+                "────────────────────────────\n"
+                "Select location:",
+                reply_markup=keyboard
+            )
+            
+            self.logger.info(f"Entry location menu sent | user={user_id} locations={len(locations)}")
+            
+        except Exception as e:
+            self.logger.error(f"Error building entry location menu | user={user_id} error={e}", exc_info=True)
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Unable to load locations. Please try again or contact support."
+            )
     
     def _handle_vendor_callback(self, chat_id: int, user_id: int, vendor: str):
         """
@@ -5777,23 +5923,64 @@ class OrderFlowHandler:
     
     def _start_vendor_selection(self, chat_id: int, user_id: int, session_token: str):
         """
-        Prompt user to select vendor (Avondale or Commissary).
+        Prompt user to select location from dynamically discovered list.
+        Uses Notion Items Master as single source of truth for locations.
         
-        Logs: vendor selection prompt.
+        Args:
+            chat_id: Telegram chat ID
+            user_id: Telegram user ID
+            session_token: Correlation token for logging
+            
+        Logs: location discovery, button generation, prompt sent
         """
-        self.logger.info(f"[{session_token}] Prompting vendor selection")
-        keyboard = self._create_keyboard([
-            [("🏪 Avondale", "order_vendor|Avondale")],
-            [("🏭 Commissary", "order_vendor|Commissary")],
-            [("❌ Cancel", "order_cancel")]
-        ])
-        self.bot.send_message(
-            chat_id,
-            "📋 <b>Interactive Order Flow</b>\n"
-            "────────────────────────────\n"
-            "Select vendor:",
-            reply_markup=keyboard
-        )
+        self.logger.info(f"[{session_token}] Prompting location selection for order")
+        
+        # Discover available locations from Notion
+        try:
+            locations = self.notion.get_locations(use_cache=True)
+            self.logger.info(f"[{session_token}] Locations discovered for order menu | count={len(locations)} locations={locations}")
+            
+            if not locations:
+                self.logger.error(f"[{session_token}] No locations available for order | cannot build menu")
+                self.bot.send_message(
+                    chat_id,
+                    "⚠️ <b>Configuration Error</b>\n"
+                    "────────────────────────────\n"
+                    "No locations found in Items Master.\n\n"
+                    "Please add items with Location property to Notion."
+                )
+                return
+            
+            # Build dynamic location buttons
+            location_buttons = []
+            for location in locations:
+                # Simple prefix for location buttons
+                button_text = f"📍 {location}"
+                callback_data = f"order_vendor|{location}"
+                location_buttons.append([(button_text, callback_data)])
+                self.logger.debug(f"[{session_token}] Built location button | text='{button_text}' callback='{callback_data}'")
+            
+            # Add cancel button
+            location_buttons.append([("❌ Cancel", "order_cancel")])
+            
+            keyboard = self._create_keyboard(location_buttons)
+            
+            self.bot.send_message(
+                chat_id,
+                "📋 <b>Interactive Order Flow</b>\n"
+                "────────────────────────────\n"
+                "Select vendor:",
+                reply_markup=keyboard
+            )
+            
+            self.logger.info(f"[{session_token}] Order location menu sent | locations={len(locations)}")
+            
+        except Exception as e:
+            self.logger.error(f"[{session_token}] Error building order location menu | error={e}", exc_info=True)
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Unable to load locations. Please try again or contact support."
+            )
     
     def handle_callback(self, callback_query: Dict):
         """
@@ -6420,6 +6607,7 @@ class OrderFlowHandler:
             
         text += f"Delivery: {delivery_date}\n"
         text += "\n".join(entered_items)
+         
         
         self.logger.info(f"[{session.session_token}] Order message prepared | items={len(entered_items)} tag_present={bool(session.person_tag)}")
         

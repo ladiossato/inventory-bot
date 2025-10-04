@@ -504,28 +504,28 @@ class ConversationState:
 class OrderSession:
     """
     State for interactive /order flow.
-    Persists vendor, item index, user-entered quantities, optional person tag, and timestamps.
+    Now fully location-agnostic - uses dynamic location from Notion.
     """
     user_id: int
     chat_id: int
-    session_token: str  # unique correlation ID for logging
-    vendor: str  # 'Avondale' or 'Commissary'
-    items: List[Dict[str, Any]]  # catalog items with name, unit, adu, current_qty
+    session_token: str
+    location: str  # Dynamic location from Notion (single source of truth)
+    items: List[Dict[str, Any]]
     
     # Date fields for delivery scheduling
-    delivery_date: Optional[str] = None  # Selected delivery date in YYYY-MM-DD format
-    next_delivery_date: Optional[str] = None  # Next expected delivery date in YYYY-MM-DD format
-    onhand_time_hint: Optional[str] = None  # 'morning' or 'night' - when on-hand was recorded
-    consumption_days: Optional[int] = None  # Computed consumption days
+    delivery_date: Optional[str] = None
+    next_delivery_date: Optional[str] = None
+    onhand_time_hint: Optional[str] = None
+    consumption_days: Optional[int] = None
     
     # Legacy fields
-    order_date: str = ""  # Deprecated - use delivery_date instead
-    submitter_name: str = ""  # Person placing the order
+    order_date: str = ""
+    submitter_name: str = ""
     
     # Item navigation
     index: int = 0
-    quantities: Dict[str, Optional[float]] = field(default_factory=dict)  # item_name -> qty or None
-    person_tag: str = ""  # optional @handle or free text
+    quantities: Dict[str, Optional[float]] = field(default_factory=dict)
+    person_tag: str = ""
     
     # Session lifecycle
     started_at: datetime = field(default_factory=datetime.now)
@@ -534,8 +534,19 @@ class OrderSession:
     last_message_id: Optional[int] = None
     
     # Input mode tracking
-    _date_input_mode: Optional[str] = None  # 'delivery' or 'next_delivery' for custom date entry
-    _calendar_month_offset: int = 0  # Offset from current month for calendar navigation
+    _date_input_mode: Optional[str] = None
+    _calendar_month_offset: int = 0
+    
+    # Legacy compatibility property
+    @property
+    def vendor(self) -> str:
+        """Alias for location to maintain compatibility with existing code."""
+        return self.location
+    
+    @vendor.setter
+    def vendor(self, value: str):
+        """Alias setter for location."""
+        self.location = value
     
     def is_expired(self) -> bool:
         """Check if session has exceeded timeout."""
@@ -1781,7 +1792,7 @@ class NotionManager:
         except Exception as e:
             self.logger.error(f"Error getting on-hand metadata | location={location} error={e}", exc_info=True)
             return None
-    
+        
     def get_missing_counts(self, location: str, date: str) -> List[str]:
         """
         Get list of items missing inventory counts for a specific date.
@@ -3874,21 +3885,35 @@ class TelegramBot:
 
     def _handle_order_avondale(self, message: Dict):
         """
-        Compatibility wrapper for /order_avondale command.
-        Delegates to interactive order flow with Avondale preselected.
+        Legacy wrapper for /order_avondale command.
+        Delegates to dynamic order flow with 'Avondale' location string.
         
-        Logs: command entry, delegation to order handler.
+        This is a compatibility shim with zero business logic.
+        The location string 'Avondale' must exist in Notion Items Master
+        for this command to work.
+        
+        Args:
+            message: Telegram message object
+            
+        Logs: command entry, delegation to handler
         """
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
         
-        self.logger.info(f"/order_avondale command | user={user_id} chat={chat_id} | delegating to interactive flow")
+        self.logger.info(f"/order_avondale command | user={user_id} chat={chat_id} | delegating to dynamic order flow")
         
         try:
+            # Delegate to order handler with literal location string
+            # This string MUST match a Location value in Notion Items Master
             self.order_handler.handle_preselected_vendor_command(message, "Avondale")
+            
         except Exception as e:
-            self.logger.error(f"/order_avondale delegation failed | error={e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to start order flow. Please try /order or contact support.")
+            self.logger.error(f"/order_avondale delegation failed | user={user_id} error={e}", exc_info=True)
+            self.send_message(
+                chat_id,
+                "⚠️ Unable to start order flow for Avondale.\n"
+                "Please try /order or contact support."
+            )
 
     def _handle_order_commissary(self, message: Dict):
         """
@@ -4068,10 +4093,10 @@ class TelegramBot:
                 for vendor in ['Avondale', 'Commissary']:
                     summary = vendor_summaries[vendor]
                     icon = "🏪" if vendor == "Avondale" else "🏭"
-                    text += (
+                text += (
                         f"├ {icon} {vendor}: {summary['ok_count']} items OK\n"
                         f"│  Coverage: {summary['coverage_days']:.1f} days\n"
-                    )
+                )
                 
                 text += (
                     f"└ Total Coverage: 100%\n\n"
@@ -4109,10 +4134,10 @@ class TelegramBot:
                             text += f"   On-Hand: {item['on_hand']:.1f} {item['unit_type']}\n"
                             text += f"   Need: {item['needed']:.1f} • Order: {item['recommended_order']}\n"
                             text += f"   Days remaining: {item['days_of_stock']:.1f}\n"
-                        
+                    
                         if len(critical_items) > 5:
                             text += f"<i>...plus {len(critical_items) - 5} more</i>\n"
-                        text += "\n"
+                    text += "\n"
                 
                 text += (
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4213,22 +4238,33 @@ class TelegramBot:
 class EntrySession:
     """
     Enhanced session state for conversational entry wizard.
+    Now fully location-agnostic - uses dynamic location from Notion.
     """
     user_id: int
     chat_id: int
-    vendor: str = ""  # 'Avondale' or 'Commissary'
+    location: str = ""  # Dynamic location from Notion (single source of truth)
     mode: str = ""  # 'on_hand' or 'received'
-    location: str = ""  # Deprecated, use vendor instead
-    items: List[Dict[str, Any]] = field(default_factory=list)  # List of items with metadata
-    index: int = 0  # Current item index
-    answers: Dict[str, Optional[float]] = field(default_factory=dict)  # item_name -> quantity
+    items: List[Dict[str, Any]] = field(default_factory=list)
+    index: int = 0
+    answers: Dict[str, Optional[float]] = field(default_factory=dict)
     started_at: datetime = field(default_factory=datetime.now)
     expires_at: datetime = field(default_factory=lambda: datetime.now() + timedelta(hours=2))
     last_message_id: Optional[int] = None
-    submitter_name: str = ""  # Captured from Telegram or user input
+    submitter_name: str = ""
     notes: str = ""
-    image_file_id: Optional[str] = None  # Telegram file ID for product image
-    current_step: str = "items"  # Track if we're on items or image step
+    image_file_id: Optional[str] = None
+    current_step: str = "items"
+    
+    # Legacy field for backwards compatibility - both point to same value
+    @property
+    def vendor(self) -> str:
+        """Alias for location to maintain compatibility with existing code."""
+        return self.location
+    
+    @vendor.setter
+    def vendor(self, value: str):
+        """Alias setter for location."""
+        self.location = value
     
     def is_expired(self) -> bool:
         """Check if session has expired."""
@@ -4430,23 +4466,28 @@ class EnhancedEntryHandler:
                 "⚠️ Unable to load locations. Please try again or contact support."
             )
     
-    def _handle_vendor_callback(self, chat_id: int, user_id: int, vendor: str):
+    def _handle_vendor_callback(self, chat_id: int, user_id: int, location: str):
         """
-        Handle vendor selection, then show mode selection (on-hand vs received).
+        Handle location selection from dynamic menu.
+        Location string comes directly from Notion Items Master via callback data.
         
-        Logs: vendor selected, mode prompt.
+        Args:
+            chat_id: Telegram chat ID
+            user_id: Telegram user ID
+            location: Location name as selected by user (from Notion)
+            
+        Logs: location selected, session creation, mode prompt
         """
-        self.logger.info(f"Vendor selected for entry | vendor={vendor} user={user_id}")
+        self.logger.info(f"Location selected for entry | location='{location}' user={user_id}")
         
-        # Create session with vendor
+        # Create session with dynamic location
         session = EntrySession(
             user_id=user_id,
             chat_id=chat_id,
-            vendor=vendor,
-            location=vendor  # Set both for compatibility
+            location=location  # Store exactly as received from Notion
         )
         self.sessions[user_id] = session
-        self.logger.info(f"Entry session created | vendor={vendor} user={user_id}")
+        self.logger.info(f"Entry session created | location='{location}' user={user_id}")
         
         # Show mode selection
         keyboard = self._create_keyboard([
@@ -4457,7 +4498,7 @@ class EnhancedEntryHandler:
         
         self.bot.send_message(
             chat_id,
-            f"📍 Location: <b>{vendor}</b>\n\n"
+            f"📍 Location: <b>{location}</b>\n\n"
             f"Select entry type:",
             reply_markup=keyboard
         )
@@ -4518,13 +4559,27 @@ class EnhancedEntryHandler:
     
     def _load_items_and_begin_entry(self, session: EntrySession):
         """
-        Load catalog items and begin item entry loop.
-        Previously this logic was inline in _handle_mode_selection.
+        Load catalog items for session's dynamic location and begin item entry loop.
+        Uses location string from session without any hard-coded checks.
         
-        Logs: catalog load, item count, first item display.
+        Args:
+            session: Entry session with location already set
+            
+        Logs: catalog load, item count, first item display
         """
-        # Load items for vendor
-        items = self.notion.get_items_for_location(session.vendor)
+        # Load items for the session's location (dynamic, no hard-coding)
+        try:
+            items = self.notion.get_items_for_location(session.location)
+            self.logger.info(f"Items loaded for entry | location='{session.location}' count={len(items)}")
+        except Exception as e:
+            self.logger.error(f"Failed to load items | location='{session.location}' error={e}", exc_info=True)
+            self.bot.send_message(
+                session.chat_id,
+                f"⚠️ Unable to load items for {session.location}. Please try again."
+            )
+            self._delete_session(session.user_id)
+            return
+        
         session.items = [
             {
                 'name': item.name,
@@ -4536,8 +4591,11 @@ class EnhancedEntryHandler:
         ]
         
         if not session.items:
-            self.logger.warning(f"No items found for entry | vendor={session.vendor}")
-            self.bot.send_message(session.chat_id, f"⚠️ No items found for {session.vendor}")
+            self.logger.warning(f"No items found for entry | location='{session.location}'")
+            self.bot.send_message(
+                session.chat_id,
+                f"⚠️ No items found for {session.location}"
+            )
             self._delete_session(session.user_id)
             return
         
@@ -4548,7 +4606,7 @@ class EnhancedEntryHandler:
         # Reset index to start item entry
         session.index = 0
         
-        self.logger.info(f"Items loaded for entry | vendor={session.vendor} count={len(session.items)} submitter={session.submitter_name}")
+        self.logger.info(f"Entry items initialized | location='{session.location}' count={len(session.items)} submitter={session.submitter_name}")
         
         # Start item entry
         mode_text = "On-Hand Count" if session.mode == "on_hand" else "Delivery"
@@ -4556,7 +4614,7 @@ class EnhancedEntryHandler:
         
         self.bot.send_message(
             session.chat_id,
-            f"📍 <b>{session.vendor} • {mode_text}</b>\n"
+            f"📍 <b>{session.location} • {mode_text}</b>\n"
             f"📅 Date: {date}\n"
             f"👤 Submitter: {session.submitter_name}\n"
             f"📦 Items: {len(session.items)}\n"
@@ -5972,15 +6030,15 @@ class OrderFlowHandler:
                 "Select vendor:",
                 reply_markup=keyboard
             )
-            
+                
             self.logger.info(f"[{session_token}] Order location menu sent | locations={len(locations)}")
-            
+                
         except Exception as e:
             self.logger.error(f"[{session_token}] Error building order location menu | error={e}", exc_info=True)
             self.bot.send_message(
                 chat_id,
                 "⚠️ Unable to load locations. Please try again or contact support."
-            )
+        )
     
     def handle_callback(self, callback_query: Dict):
         """
@@ -6067,60 +6125,75 @@ class OrderFlowHandler:
         elif data == "order_review_back":
             self._resume_items(chat_id, user_id)
     
-    def _handle_vendor_selection(self, chat_id: int, user_id: int, vendor: str):
+    def _handle_vendor_selection(self, chat_id: int, user_id: int, location: str):
         """
-        Handle vendor selection, create session, then show calendar picker for delivery date.
+        Handle location selection from dynamic menu.
+        Location string comes directly from Notion Items Master via callback data.
         
-        Logs: vendor selected, session creation, calendar prompt.
+        Args:
+            chat_id: Telegram chat ID
+            user_id: Telegram user ID
+            location: Location name as selected by user (from Notion)
+            
+        Logs: location selected, session creation, calendar prompt
         """
         session_token = str(uuid.uuid4())[:8]
-        self.logger.info(f"[{session_token}] Vendor selected | vendor={vendor} user={user_id}")
+        self.logger.info(f"[{session_token}] Location selected for order | location='{location}' user={user_id}")
         
-        # Create session with vendor
+        # Create session with dynamic location
         session = OrderSession(
             user_id=user_id,
             chat_id=chat_id,
             session_token=session_token,
-            vendor=vendor,
+            location=location,  # Store exactly as received from Notion
             items=[],
             _calendar_month_offset=0
         )
         
         self.sessions[user_id] = session
-        self.logger.info(f"[{session_token}] Session created | vendor={vendor}")
+        self.logger.info(f"[{session_token}] Order session created | location='{location}'")
         
         # Show calendar picker for delivery date
         self._show_calendar_picker(session, "delivery")
-
+    
     def _load_items_and_begin_entry(self, session: OrderSession):
         """
-        Load catalog items and begin item entry loop.
-        Previously this was part of _handle_vendor_selection.
+        Load catalog items for session's dynamic location and begin item entry loop.
+        Uses location string from session without any hard-coded checks.
         
-        Logs: catalog load, item count, first item display.
+        Args:
+            session: Order session with location already set
+            
+        Logs: catalog load, inventory load, item count, first item display
         """
-        # Load items for vendor
+        # Load items for the session's location (dynamic, no hard-coding)
         try:
-            items_objs = self.notion.get_items_for_location(session.vendor, use_cache=False)
-            self.logger.info(f"[{session.session_token}] Loaded {len(items_objs)} items from Notion | vendor={session.vendor}")
+            items_objs = self.notion.get_items_for_location(session.location, use_cache=False)
+            self.logger.info(f"[{session.session_token}] Items loaded | location='{session.location}' count={len(items_objs)}")
         except Exception as e:
-            self.logger.error(f"[{session.session_token}] Failed to load items | vendor={session.vendor} error={e}", exc_info=True)
-            self.bot.send_message(session.chat_id, "⚠️ Unable to load catalog items. Please try again.")
+            self.logger.error(f"[{session.session_token}] Failed to load items | location='{session.location}' error={e}", exc_info=True)
+            self.bot.send_message(
+                session.chat_id,
+                f"⚠️ Unable to load catalog items for {session.location}. Please try again."
+            )
             self._delete_session(session.user_id)
             return
         
         if not items_objs:
-            self.logger.warning(f"[{session.session_token}] No items found | vendor={session.vendor}")
-            self.bot.send_message(session.chat_id, f"⚠️ No items found for {session.vendor}")
+            self.logger.warning(f"[{session.session_token}] No items found | location='{session.location}'")
+            self.bot.send_message(
+                session.chat_id,
+                f"⚠️ No items found for {session.location}"
+            )
             self._delete_session(session.user_id)
             return
         
-        # Get current inventory (On Hand)
+        # Get current inventory (On Hand) for the session's location
         try:
-            inventory_data = self.notion.get_latest_inventory(session.vendor, entry_type="on_hand")
-            self.logger.info(f"[{session.session_token}] Loaded inventory data | vendor={session.vendor} items_count={len(inventory_data)}")
+            inventory_data = self.notion.get_latest_inventory(session.location, entry_type="on_hand")
+            self.logger.info(f"[{session.session_token}] Inventory loaded | location='{session.location}' items_count={len(inventory_data)}")
         except Exception as e:
-            self.logger.error(f"[{session.session_token}] Failed to load inventory | vendor={session.vendor} error={e}", exc_info=True)
+            self.logger.error(f"[{session.session_token}] Failed to load inventory | location='{session.location}' error={e}", exc_info=True)
             inventory_data = {}
         
         # Build items list with On Hand and ADU
@@ -6145,12 +6218,12 @@ class OrderFlowHandler:
         # Reset index to start item entry
         session.index = 0
         
-        self.logger.info(f"[{session.session_token}] Items loaded | count={len(items)}")
+        self.logger.info(f"[{session.session_token}] Order items initialized | location='{session.location}' count={len(items)}")
         
         # Show welcome and first item
         self.bot.send_message(
             session.chat_id,
-            f"📋 <b>{session.vendor} Order</b>\n"
+            f"📋 <b>{session.location} Order</b>\n"
             f"────────────────────────────\n"
             f"Date: {session.order_date}\n"
             f"Submitter: {session.submitter_name}\n"
@@ -6362,8 +6435,8 @@ class OrderFlowHandler:
             self.logger.info(f"[{session.session_token}] Submitter name captured | name='{session.submitter_name}'")
             
             # Now load items and begin entry
-            self._load_items_and_begin_entry(session)
-            return
+        self._load_items_and_begin_entry(session)
+        return
 
         # Check if we're on Review screen waiting for person tag
         

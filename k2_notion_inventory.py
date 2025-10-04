@@ -6391,14 +6391,9 @@ class OrderFlowHandler:
             )
             return
         
-        # Get delivery date
-        try:
-            summary = self.calc.generate_auto_requests(session.vendor)
-            delivery_date = summary.get("delivery_date", "—")
-            self.logger.info(f"[{session.session_token}] Delivery date retrieved | date={delivery_date}")
-        except Exception as e:
-            self.logger.error(f"[{session.session_token}] Failed to get delivery date | error={e}", exc_info=True)
-            delivery_date = "—"
+        # Get delivery date from session (user selected via calendar)
+        delivery_date = session.delivery_date if session.delivery_date else "—"
+        self.logger.info(f"[{session.session_token}] Using selected delivery date | date={delivery_date}")
         
         # Build final message
         entered_items = []

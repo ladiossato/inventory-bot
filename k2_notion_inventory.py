@@ -3765,123 +3765,134 @@ class TelegramBot:
 
     def _handle_info(self, message: Dict):
         """
-        Display inventory dashboard with FIXED consumption math.
-        Shows forecasted on-hand at delivery and post-delivery needs.
+        Display inventory dashboard for all locations dynamically discovered from Notion.
+        Shows forecasted on-hand at delivery and post-delivery needs for each location.
+
+        No hard-coded location names — fully dynamic from Notion.
+
+        Args:
+            message: Telegram message object
+
+        Logs: command entry, location discovery, per-location calculation
         """
-        import math
         chat_id = message["chat"]["id"]
-        
+
         def format_critical_item(item: dict) -> str:
-            """Format critical item with forecasted values."""
-            name = item.get("item_name", "Unknown")
+            """Format one critical item with forecast values (no bold, no dashes)."""
+            name = str(item.get("item_name", "Unknown")).strip() or "Unknown"
             unit = item.get("unit_type", "unit")
-            current = float(item.get("current_qty", 0))
-            oh_delivery = float(item.get("oh_at_delivery", 0))
-            need = float(item.get("consumption_need", 0))  # This is Need_post
+            current = float(item.get("current_qty", 0) or 0)
+            oh_delivery = float(item.get("oh_at_delivery", 0) or 0)
+            need = float(item.get("consumption_need", 0) or 0)
             order = item.get("required_order_rounded", 0)
-            
-            # Determine status icon based on severity
+
+            # Severity icon
             if oh_delivery == 0:
                 status_icon = "🚨"
-            elif oh_delivery < need * 0.3:
+            elif need > 0 and oh_delivery < need * 0.3:
                 status_icon = "⚠️"
             else:
                 status_icon = "📉"
-            
-            # Format the display
+
             return (
-                f"{status_icon} <b>{name}</b>\n"
-                f"   Order {order} {unit} • Now: {current:.1f} → Delivery: {oh_delivery:.1f}\n"
+                f"{status_icon} {name}\n"
+                f"   Order {order} {unit} • Now {current:.1f} → Delivery {oh_delivery:.1f}\n"
                 f"   Need {need:.1f} for post-delivery window"
             )
-        
+
         try:
             now = get_time_in_timezone(BUSINESS_TIMEZONE)
-            avondale = self.calc.calculate_location_summary("Avondale")
-            commissary = self.calc.calculate_location_summary("Commissary")
-            
-            # Header with timestamp
+            self.logger.info(f"/info command | chat={chat_id} time={now.strftime('%Y-%m-%d %H:%M')}")
+
+            # Discover all locations dynamically from Notion
+            try:
+                locations = self.notion.get_locations(use_cache=True)
+                self.logger.info(f"Info: discovered locations | count={len(locations)} locations={locations}")
+            except Exception as e:
+                self.logger.error(f"Info: failed to discover locations | error={e}", exc_info=True)
+                self.send_message(
+                    chat_id,
+                    "Unable to load locations from Notion. Please try again or contact support."
+                )
+                return
+
+            # Normalize, dedupe, sort
+            norm_locations = sorted({str(loc).strip() for loc in (locations or []) if str(loc).strip()})
+            if not norm_locations:
+                self.logger.error("Info: no locations found in Items Master")
+                self.send_message(
+                    chat_id,
+                    "No locations found in Items Master. Please add items with a Location property in Notion."
+                )
+                return
+
+            # Header
             text = (
-                "📊 <b>Inventory Dashboard</b>\n"
-                f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Inventory dashboard\n"
+                f"{now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
             )
-            
-            # Avondale Section
-            a_red = avondale.get("status_counts", {}).get("RED", 0)
-            a_green = avondale.get("status_counts", {}).get("GREEN", 0)
-            a_days = avondale.get("days_until_delivery", 0)
-            a_delivery = avondale.get("delivery_date", "—")
-            a_cycle = avondale.get("order_cycle", {})
-            
+
+            # Per-location summaries
+            for location in norm_locations:
+                try:
+                    summary = self.calc.calculate_location_summary(location)
+                    self.logger.info(f"Info: calculated summary | location='{location}'")
+                except Exception as e:
+                    self.logger.error(
+                        f"Info: failed to calculate summary | location='{location}' error={e}",
+                        exc_info=True
+                    )
+                    text += f"{location.upper()}\n"
+                    text += "Error calculating status\n\n"
+                    continue
+
+                status_counts = summary.get("status_counts", {}) or {}
+                red_count = int(status_counts.get("RED", 0) or 0)
+                green_count = int(status_counts.get("GREEN", 0) or 0)
+                days_until = float(summary.get("days_until_delivery", 0) or 0)
+                delivery_date = summary.get("delivery_date", "—") or "—"
+
+                text += (
+                    f"{location.upper()}\n"
+                    f"  Next delivery: {delivery_date} ({days_until:.1f} days)\n"
+                    f"  Status: 🔴 {red_count} • 🟢 {green_count}\n"
+                )
+
+                # Critical items
+                items = summary.get("items", []) or []
+                critical = [it for it in items if it.get("status") == "RED"]
+
+                if critical:
+                    text += "  Critical items:\n"
+                    for it in sorted(
+                        critical,
+                        key=lambda x: (x.get("required_order_rounded") or 0),
+                        reverse=True
+                    )[:5]:
+                        for line in format_critical_item(it).split("\n"):
+                            text += f"    {line}\n"
+                    if len(critical) > 5:
+                        text += f"    ...and {len(critical) - 5} more critical\n"
+                else:
+                    text += "  All items sufficient through next delivery\n"
+
+                text += "\n"
+
+            # Footer
             text += (
-                "🏪 <b>AVONDALE</b>\n"
-                f"├ Next Delivery: {a_delivery} ({a_days:.1f} days)\n"
-                f"├ Status: 🔴 {a_red} • 🟢 {a_green}\n"
-            )
-            
-            # Avondale critical items
-            a_critical = [item for item in avondale.get("items", []) 
-                        if item.get("status") == "RED"]
-            if a_critical:
-                text += "└ <b>Critical Items:</b>\n"
-                for item in sorted(a_critical, 
-                                key=lambda x: x.get("required_order_rounded", 0), 
-                                reverse=True)[:5]:
-                    lines = format_critical_item(item).split('\n')
-                    for line in lines:
-                        text += f"  {line}\n"
-                if len(a_critical) > 5:
-                    text += f"  <i>...and {len(a_critical) - 5} more critical</i>\n"
-            else:
-                text += "└ ✅ All items sufficient through next delivery\n"
-            
-            text += "\n"
-            
-            # Commissary Section
-            c_red = commissary.get("status_counts", {}).get("RED", 0)
-            c_green = commissary.get("status_counts", {}).get("GREEN", 0)
-            c_days = commissary.get("days_until_delivery", 0)
-            c_delivery = commissary.get("delivery_date", "—")
-            c_cycle = commissary.get("order_cycle", {})
-            
-            text += (
-                "🏭 <b>COMMISSARY</b>\n"
-                f"├ Next Delivery: {c_delivery} ({c_days:.1f} days)\n"
-                f"├ Status: 🔴 {c_red} • 🟢 {c_green}\n"
-            )
-            
-            # Commissary critical items
-            c_critical = [item for item in commissary.get("items", []) 
-                        if item.get("status") == "RED"]
-            if c_critical:
-                text += "└ <b>Critical Items:</b>\n"
-                for item in sorted(c_critical, 
-                                key=lambda x: x.get("required_order_rounded", 0), 
-                                reverse=True)[:5]:
-                    lines = format_critical_item(item).split('\n')
-                    for line in lines:
-                        text += f"  {line}\n"
-                if len(c_critical) > 5:
-                    text += f"  <i>...and {len(c_critical) - 5} more critical</i>\n"
-            else:
-                text += "└ ✅ All items sufficient through next delivery\n"
-            
-            # Footer with explanation
-            text += (
-                "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📌 <b>How to read:</b>\n"
+                "How to read:\n"
                 "• Now → Delivery: consumption forecast\n"
                 "• Need: required for post-delivery period\n"
-                "• /order for supplier-ready list"
+                "• Use /order for a supplier-ready list"
             )
-            
+
             self.send_message(chat_id, text)
-            self.logger.info(f"/info sent - A: {a_red} red, C: {c_red} red")
-            
+            self.logger.info(f"/info sent | locations={len(norm_locations)}")
+
         except Exception as e:
-            self.logger.error(f"/info failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate dashboard. Please try again.")
+            self.logger.error(f"/info failed | error={e}", exc_info=True)
+            self.send_message(chat_id, "Unable to generate dashboard. Please try again.")
+
 
     def _handle_order_avondale(self, message: Dict):
         """
@@ -3917,21 +3928,35 @@ class TelegramBot:
 
     def _handle_order_commissary(self, message: Dict):
         """
-        Compatibility wrapper for /order_commissary command.
-        Delegates to interactive order flow with Commissary preselected.
+        Legacy wrapper for /order_commissary command.
+        Delegates to dynamic order flow with 'Commissary' location string.
         
-        Logs: command entry, delegation to order handler.
+        This is a compatibility shim with zero business logic.
+        The location string 'Commissary' must exist in Notion Items Master
+        for this command to work.
+        
+        Args:
+            message: Telegram message object
+            
+        Logs: command entry, delegation to handler
         """
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
         
-        self.logger.info(f"/order_commissary command | user={user_id} chat={chat_id} | delegating to interactive flow")
+        self.logger.info(f"/order_commissary command | user={user_id} chat={chat_id} | delegating to dynamic order flow")
         
         try:
+            # Delegate to order handler with literal location string
+            # This string MUST match a Location value in Notion Items Master
             self.order_handler.handle_preselected_vendor_command(message, "Commissary")
+            
         except Exception as e:
-            self.logger.error(f"/order_commissary delegation failed | error={e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to start order flow. Please try /order or contact support.")
+            self.logger.error(f"/order_commissary delegation failed | user={user_id} error={e}", exc_info=True)
+            self.send_message(
+                chat_id,
+                "⚠️ Unable to start order flow for Commissary.\n"
+                "Please try /order or contact support."
+            )
     
     def _compute_item_coverage_status(self, item_name: str, adu: float, on_hand: float, 
                                        coverage_days: float, unit_type: str) -> Dict[str, Any]:
@@ -3986,67 +4011,95 @@ class TelegramBot:
 
     def _handle_reassurance(self, message: Dict):
         """
-        Daily risk assessment with correct coverage math.
-        
-        For each vendor, evaluates items using:
-        - On-Hand from Notion (latest entry)
-        - ADU from Notion catalog
-        - Coverage days from vendor config
-        - Critical if: OnHand < (ADU × coverage_days)
-        - Recommended order = ceil(ADU × coverage_days - OnHand)
-        
-        Logs: Notion queries, item evaluations, critical count
+        Daily risk assessment across all locations dynamically discovered from Notion.
+
+        For each location in Items Master:
+        - Loads items and latest on-hand inventory
+        - Calculates coverage using location-specific consumption days
+        - Identifies critical items needing immediate orders
+        - Computes recommended order quantities
+
+        No hard-coded location names — fully dynamic from Notion.
+
+        Args:
+            message: Telegram message object
+
+        Logs: command entry, location discovery, per-location evaluation, summary
         """
         chat_id = message["chat"]["id"]
-        
+
         try:
             now = get_time_in_timezone(BUSINESS_TIMEZONE)
-            
             self.logger.info(f"/reassurance command | chat={chat_id} time={now.strftime('%Y-%m-%d %H:%M')}")
-            
-            # Define coverage days per vendor
-            vendor_coverage = {
-                'Avondale': 3.5,  # Average of Monday (3.0) and Thursday (4.0)
-                'Commissary': 2.33  # Average of Tue/Thu (2.0) and Sat (3.0)
-            }
-            
+
+            # Discover all locations dynamically from Notion
+            try:
+                locations = self.notion.get_locations(use_cache=True)
+                self.logger.info(f"Reassurance: discovered locations | count={len(locations)} locations={locations}")
+            except Exception as e:
+                self.logger.error(f"Reassurance: failed to discover locations | error={e}", exc_info=True)
+                self.send_message(chat_id, "Unable to load locations from Notion. Please try again or contact support.")
+                return
+
+            # Normalize, dedupe, sort
+            norm_locations = sorted({str(loc).strip() for loc in (locations or []) if str(loc).strip()})
+            if not norm_locations:
+                self.logger.error("Reassurance: no locations found in Items Master")
+                self.send_message(chat_id, "No locations found in Items Master. Please add items with a Location property in Notion.")
+                return
+
+            # Define coverage days per location from config if present
+            default_coverage_days = 3.0
+            location_coverage = {}
+            inventory_config = globals().get("INVENTORY_CONFIG", {}) or {}
+
+            for location in norm_locations:
+                if location in inventory_config:
+                    schedule = inventory_config[location].get("consumption_schedule", {}) or {}
+                    if schedule:
+                        avg_days = sum(schedule.values()) / max(len(schedule), 1)
+                        location_coverage[location] = float(avg_days)
+                        self.logger.debug(f"Reassurance: loaded coverage from config | location='{location}' days={avg_days:.2f}")
+                    else:
+                        location_coverage[location] = default_coverage_days
+                        self.logger.debug(f"Reassurance: using default coverage | location='{location}' days={default_coverage_days}")
+                else:
+                    location_coverage[location] = default_coverage_days
+                    self.logger.info(f"Reassurance: location not in config, using default | location='{location}' days={default_coverage_days}")
+
             all_critical_items = []
-            vendor_summaries = {}
-            
-            # Evaluate each vendor
-            for vendor in ['Avondale', 'Commissary']:
-                coverage_days = vendor_coverage.get(vendor, 3.0)
-                
-                self.logger.info(f"Evaluating {vendor} | coverage_days={coverage_days}")
-                
-                # Get items from Notion
+            location_summaries = {}
+
+            # Evaluate each location dynamically
+            for location in norm_locations:
+                coverage_days = float(location_coverage.get(location, default_coverage_days))
+                self.logger.info(f"Reassurance: evaluating location | location='{location}' coverage_days={coverage_days}")
+
+                # Get items from Notion for this location
                 try:
-                    items = self.notion.get_items_for_location(vendor, use_cache=False)
-                    self.logger.info(f"{vendor} items loaded | count={len(items)}")
+                    items = self.notion.get_items_for_location(location, use_cache=False)
+                    self.logger.info(f"Reassurance: items loaded | location='{location}' count={len(items)}")
                 except Exception as e:
-                    self.logger.error(f"Failed to load items for {vendor} | error={e}", exc_info=True)
+                    self.logger.error(f"Reassurance: failed to load items | location='{location}' error={e}", exc_info=True)
                     items = []
-                
-                # Get latest On-Hand inventory
+
+                # Get latest On-Hand inventory for this location
                 try:
-                    inventory_data = self.notion.get_latest_inventory(vendor, entry_type="on_hand")
-                    self.logger.info(f"{vendor} inventory loaded | items_with_qty={len(inventory_data)}")
+                    inventory_data = self.notion.get_latest_inventory(location, entry_type="on_hand")
+                    self.logger.info(f"Reassurance: inventory loaded | location='{location}' items_with_qty={len(inventory_data)}")
                 except Exception as e:
-                    self.logger.error(f"Failed to load inventory for {vendor} | error={e}", exc_info=True)
+                    self.logger.error(f"Reassurance: failed to load inventory | location='{location}' error={e}", exc_info=True)
                     inventory_data = {}
-                
-                # Evaluate each item
+
+                # Evaluate each item for this location
                 critical_items = []
                 ok_items = []
-                
+
                 for item in items:
-                    on_hand = inventory_data.get(item.name, 0.0)
-                    
-                    # Log missing data
+                    on_hand = float(inventory_data.get(item.name, 0.0))
                     if item.name not in inventory_data:
-                        self.logger.warning(f"Missing on-hand data | vendor={vendor} item={item.name} | defaulting to 0.0")
-                    
-                    # Compute coverage status
+                        self.logger.warning(f"Reassurance: missing on-hand data | location='{location}' item={item.name} | defaulting to 0.0")
+
                     status = self._compute_item_coverage_status(
                         item_name=item.name,
                         adu=item.adu,
@@ -4054,112 +4107,108 @@ class TelegramBot:
                         coverage_days=coverage_days,
                         unit_type=item.unit_type
                     )
-                    
-                    if status['critical']:
+
+                    if status.get("critical"):
                         critical_items.append(status)
                     else:
                         ok_items.append(status)
-                
-                vendor_summaries[vendor] = {
-                    'coverage_days': coverage_days,
-                    'total_items': len(items),
-                    'critical_count': len(critical_items),
-                    'ok_count': len(ok_items),
-                    'critical_items': critical_items
+
+                location_summaries[location] = {
+                    "coverage_days": coverage_days,
+                    "total_items": len(items),
+                    "critical_count": len(critical_items),
+                    "ok_count": len(ok_items),
+                    "critical_items": critical_items,
                 }
-                
+
                 all_critical_items.extend(critical_items)
-                
                 self.logger.info(
-                    f"{vendor} evaluated | total={len(items)} critical={len(critical_items)} ok={len(ok_items)}"
+                    f"Reassurance: location evaluated | location='{location}' total={len(items)} critical={len(critical_items)} ok={len(ok_items)}"
                 )
-            
+
             # Build message
             total_critical = len(all_critical_items)
-            
+
             if total_critical == 0:
                 # All clear message
                 text = (
-                    "✅ <b>DAILY RISK ASSESSMENT</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
-                    
-                    "🟢 <b>ALL CLEAR</b>\n"
+                    "Daily risk assessment\n"
+                    f"{now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
+                    "All clear\n"
                     "No critical inventory issues detected\n\n"
-                    
-                    "📊 <b>Location Status</b>\n"
+                    "Location status\n"
                 )
-                
-                for vendor in ['Avondale', 'Commissary']:
-                    summary = vendor_summaries[vendor]
-                    icon = "🏪" if vendor == "Avondale" else "🏭"
+
+                for location in norm_locations:
+                    summary = location_summaries.get(location, {})
+                    text += (
+                        f"{location}: {summary.get('ok_count', 0)} items OK\n"
+                        f"  Coverage: {float(summary.get('coverage_days', default_coverage_days)):.1f} days\n"
+                    )
+
                 text += (
-                        f"├ {icon} {vendor}: {summary['ok_count']} items OK\n"
-                        f"│  Coverage: {summary['coverage_days']:.1f} days\n"
+                    "Total coverage: 100%\n\n"
+                    "All inventory levels sufficient\n"
+                    "No immediate action required\n\n"
+                    "System status: Healthy"
                 )
-                
-                text += (
-                    f"└ Total Coverage: 100%\n\n"
-                    
-                    "✅ All inventory levels sufficient\n"
-                    "✅ No immediate action required\n\n"
-                    
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "💚 <b>System Status: Healthy</b>"
-                )
+
             else:
                 # Critical items alert
                 text = (
-                    "🚨 <b>DAILY RISK ASSESSMENT</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🕐 {now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
-                    
-                    f"⚠️ <b>ACTION REQUIRED</b>\n"
+                    "Daily risk assessment\n"
+                    f"{now.strftime('%I:%M %p')} • {now.strftime('%A, %b %d')}\n\n"
+                    "Action required\n"
                     f"{total_critical} item{'s' if total_critical != 1 else ''} need ordering\n\n"
                 )
-                
-                # Show critical items by vendor
-                for vendor in ['Avondale', 'Commissary']:
-                    summary = vendor_summaries[vendor]
-                    critical_items = summary['critical_items']
-                    
+
+                # Show critical items by location
+                for location in norm_locations:
+                    summary = location_summaries.get(location, {})
+                    critical_items = summary.get("critical_items", []) or []
+
                     if critical_items:
-                        icon = "🏪" if vendor == "Avondale" else "🏭"
-                        text += f"{icon} <b>{vendor.upper()} ({len(critical_items)} critical)</b>\n"
-                        text += f"Coverage requirement: {summary['coverage_days']:.1f} days\n\n"
-                        
-                        # Sort by severity (lowest days of stock first)
-                        for item in sorted(critical_items, key=lambda x: x['days_of_stock'])[:5]:
-                            text += f"🔴 <b>{item['item_name']}</b>\n"
-                            text += f"   On-Hand: {item['on_hand']:.1f} {item['unit_type']}\n"
-                            text += f"   Need: {item['needed']:.1f} • Order: {item['recommended_order']}\n"
-                            text += f"   Days remaining: {item['days_of_stock']:.1f}\n"
-                    
+                        text += f"{location.upper()} ({len(critical_items)} critical)\n"
+                        text += f"Coverage requirement: {float(summary.get('coverage_days', default_coverage_days)):.1f} days\n\n"
+
+                        # Sort by severity (lowest days of stock first) and show top 5
+                        for item in sorted(critical_items, key=lambda x: x.get("days_of_stock", 0.0))[:5]:
+                            text += f"🔴 {item.get('item_name', 'Unknown')}\n"
+                            text += f"   On-hand: {float(item.get('on_hand', 0.0)):.1f} {item.get('unit_type', 'unit')}\n"
+                            text += f"   Need: {float(item.get('needed', 0.0)):.1f} • Order: {item.get('recommended_order', 0)}\n"
+                            text += f"   Days remaining: {float(item.get('days_of_stock', 0.0)):.1f}\n"
+
                         if len(critical_items) > 5:
-                            text += f"<i>...plus {len(critical_items) - 5} more</i>\n"
-                    text += "\n"
-                
+                            text += f"...plus {len(critical_items) - 5} more\n"
+
+                        text += "\n"
+
                 text += (
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "⚠️ <b>IMMEDIATE ACTION NEEDED</b>\n"
-                    "These items need ordering NOW\n\n"
-                    "📞 Contact supplier immediately\n"
-                    "📋 Use /order for complete list"
+                    "Immediate action needed\n"
+                    "These items need ordering now\n\n"
+                    "Contact supplier immediately\n"
+                    "Use /order for complete list"
                 )
-            
+
             # Send to reassurance chat if different from requester
-            reassurance_chat = self.chat_config.get('reassurance')
+            reassurance_chat = self.chat_config.get("reassurance")
             if reassurance_chat and reassurance_chat != chat_id:
                 self.send_message(reassurance_chat, text)
                 self.logger.info(f"Reassurance sent to management chat {reassurance_chat}")
-            
+
             # Always send to requesting user
             self.send_message(chat_id, text)
-            self.logger.info(f"/reassurance sent | total_critical={total_critical} avondale={vendor_summaries['Avondale']['critical_count']} commissary={vendor_summaries['Commissary']['critical_count']}")
-            
+
+            # Log summary
+            summary_log = " | ".join(
+                [f"{loc}={location_summaries.get(loc, {}).get('critical_count', 0)}" for loc in norm_locations]
+            )
+            self.logger.info(f"Reassurance complete | total_critical={total_critical} by_location=[{summary_log}]")
+
         except Exception as e:
-            self.logger.error(f"/reassurance failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate risk assessment. Please try again.")
+            self.logger.error(f"Reassurance failed | error={e}", exc_info=True)
+            self.send_message(chat_id, "Unable to generate risk assessment. Please try again.")
+
 
             
     
@@ -5299,7 +5348,7 @@ class OrderFlowHandler:
         self.calc = calculator
         self.logger = logging.getLogger('business')
         self.sessions: Dict[int, OrderSession] = {}
-    
+
     def _get_kitchen_timezone(self) -> str:
         """
         Get kitchen timezone for date/time calculations.
@@ -5885,33 +5934,64 @@ class OrderFlowHandler:
             self.bot.send_message(chat_id, "⚠️ Error using recommended quantity. Please try again.")
             self._show_current_item(session)
 
-    def handle_preselected_vendor_command(self, message: Dict, vendor: str):
+    def handle_preselected_vendor_command(self, message: Dict, location: str):
         """
-        Entry point for vendor-specific commands (/order_avondale, /order_commissary).
-        Delegates to interactive flow with vendor preselected.
+        Entry point for location-specific commands (legacy wrappers).
+        Validates that the requested location exists in Notion before proceeding.
         
-        Logs: command entry, vendor, session check, delegation.
+        Args:
+            message: Telegram message object
+            location: Location name string (must exist in Notion Items Master)
+            
+        Logs: command entry, location validation, session check, delegation
         """
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
         session_token = str(uuid.uuid4())[:8]
         
-        self.logger.info(f"[{session_token}] Vendor-specific order command | vendor={vendor} user={user_id} chat={chat_id}")
+        self.logger.info(f"[{session_token}] Preselected location command | location='{location}' user={user_id} chat={chat_id}")
+        
+        # Validate that this location exists in Notion
+        try:
+            available_locations = self.notion.get_locations(use_cache=True)
+            self.logger.debug(f"[{session_token}] Available locations | count={len(available_locations)} locations={available_locations}")
+            
+            if location not in available_locations:
+                self.logger.error(f"[{session_token}] Invalid location requested | location='{location}' available={available_locations}")
+                self.bot.send_message(
+                    chat_id,
+                    f"⚠️ <b>Invalid Location</b>\n"
+                    f"────────────────────────────\n"
+                    f"Location '{location}' not found in Items Master.\n\n"
+                    f"Available locations: {', '.join(available_locations)}\n\n"
+                    f"Use /order to see all locations."
+                )
+                return
+            
+            self.logger.info(f"[{session_token}] Location validated | location='{location}'")
+            
+        except Exception as e:
+            self.logger.error(f"[{session_token}] Location validation failed | location='{location}' error={e}", exc_info=True)
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Unable to validate location. Please try /order or contact support."
+            )
+            return
         
         # Check for active session
         if user_id in self.sessions:
             session = self.sessions[user_id]
             if not session.is_expired():
-                # If existing session is for same vendor, offer resume
-                if session.vendor == vendor:
-                    self.logger.info(f"[{session.session_token}] Active session for same vendor | vendor={vendor} progress={session.get_progress()}")
+                # If existing session is for same location, offer resume
+                if session.location == location:
+                    self.logger.info(f"[{session.session_token}] Active session for same location | location='{location}' progress={session.get_progress()}")
                     keyboard = self._create_keyboard([
                         [("📂 Resume", "order_resume"), ("🔄 Start Over", "order_restart")],
                         [("❌ Cancel", "order_cancel_existing")]
                     ])
                     self.bot.send_message(
                         chat_id,
-                        f"📋 <b>Active {vendor} Order Session</b>\n"
+                        f"📋 <b>Active {location} Order Session</b>\n"
                         f"────────────────────────────\n"
                         f"Progress: {session.get_progress()} • Entered: {session.get_entered_count()}\n\n"
                         f"What would you like to do?",
@@ -5919,26 +5999,26 @@ class OrderFlowHandler:
                     )
                     return
                 else:
-                    # Different vendor - inform and offer to cancel old session
-                    self.logger.info(f"[{session.session_token}] Active session for different vendor | existing={session.vendor} requested={vendor}")
+                    # Different location - inform and offer to cancel old session
+                    self.logger.info(f"[{session.session_token}] Active session for different location | existing='{session.location}' requested='{location}'")
                     keyboard = self._create_keyboard([
-                        [("🔄 Switch to " + vendor, "order_restart")],
+                        [("🔄 Switch to " + location, "order_restart")],
                         [("❌ Cancel", "order_cancel_existing")]
                     ])
                     self.bot.send_message(
                         chat_id,
-                        f"⚠️ <b>Active Session for {session.vendor}</b>\n"
+                        f"⚠️ <b>Active Session for {session.location}</b>\n"
                         f"────────────────────────────\n"
-                        f"You have an active order for {session.vendor}.\n"
+                        f"You have an active order for {session.location}.\n"
                         f"Progress: {session.get_progress()}\n\n"
-                        f"Cancel it to start {vendor} order?",
+                        f"Cancel it to start {location} order?",
                         reply_markup=keyboard
                     )
                     return
         
-        # No active session - start directly with vendor
-        self.logger.info(f"[{session_token}] No active session | starting directly with vendor={vendor}")
-        self._handle_vendor_selection(chat_id, user_id, vendor)
+        # No active session - start directly with location
+        self.logger.info(f"[{session_token}] No active session | starting directly with location='{location}'")
+        self._handle_vendor_selection(chat_id, user_id, location)
     
     def handle_order_command(self, message: Dict):
         """
@@ -5983,62 +6063,67 @@ class OrderFlowHandler:
         """
         Prompt user to select location from dynamically discovered list.
         Uses Notion Items Master as single source of truth for locations.
-        
+
         Args:
             chat_id: Telegram chat ID
             user_id: Telegram user ID
             session_token: Correlation token for logging
-            
+
         Logs: location discovery, button generation, prompt sent
         """
         self.logger.info(f"[{session_token}] Prompting location selection for order")
-        
-        # Discover available locations from Notion
+
         try:
+            # Discover available locations from Notion
             locations = self.notion.get_locations(use_cache=True)
-            self.logger.info(f"[{session_token}] Locations discovered for order menu | count={len(locations)} locations={locations}")
-            
+            self.logger.info(
+                f"[{session_token}] Locations discovered for order menu | count={len(locations)} locations={locations}"
+            )
+
+            # Normalize, de-dup, and sort for stable button order
             if not locations:
-                self.logger.error(f"[{session_token}] No locations available for order | cannot build menu")
-                self.bot.send_message(
-                    chat_id,
-                    "⚠️ <b>Configuration Error</b>\n"
-                    "────────────────────────────\n"
-                    "No locations found in Items Master.\n\n"
-                    "Please add items with Location property to Notion."
-                )
-                return
-            
+                raise ValueError("No locations returned from Notion")
+
+            norm_locations = sorted({str(loc).strip() for loc in locations if str(loc).strip()})
+            if not norm_locations:
+                raise ValueError("No usable locations after normalization")
+
             # Build dynamic location buttons
             location_buttons = []
-            for location in locations:
-                # Simple prefix for location buttons
+            for location in norm_locations:
                 button_text = f"📍 {location}"
                 callback_data = f"order_vendor|{location}"
                 location_buttons.append([(button_text, callback_data)])
-                self.logger.debug(f"[{session_token}] Built location button | text='{button_text}' callback='{callback_data}'")
-            
+                self.logger.debug(
+                    f"[{session_token}] Built location button | text='{button_text}' callback='{callback_data}'"
+                )
+
             # Add cancel button
             location_buttons.append([("❌ Cancel", "order_cancel")])
-            
+
             keyboard = self._create_keyboard(location_buttons)
-            
+
+            # Send prompt
             self.bot.send_message(
                 chat_id,
-                "📋 <b>Interactive Order Flow</b>\n"
-                "────────────────────────────\n"
-                "Select vendor:",
-                reply_markup=keyboard
+                "Interactive order flow\nSelect vendor:",
+                reply_markup=keyboard,
             )
-                
-            self.logger.info(f"[{session_token}] Order location menu sent | locations={len(locations)}")
-                
+            self.logger.info(
+                f"[{session_token}] Order location menu sent | locations={len(norm_locations)}"
+            )
+
         except Exception as e:
-            self.logger.error(f"[{session_token}] Error building order location menu | error={e}", exc_info=True)
+            self.logger.error(
+                f"[{session_token}] Error building order location menu | error={e}",
+                exc_info=True,
+            )
             self.bot.send_message(
                 chat_id,
-                "⚠️ Unable to load locations. Please try again or contact support."
-        )
+                "Unable to load locations. Please try again or contact support.",
+            )
+
+
     
     def handle_callback(self, callback_query: Dict):
         """
@@ -6343,11 +6428,12 @@ class OrderFlowHandler:
 
     def handle_text_input(self, message: Dict, session: OrderSession):
         """
-        Validate and process text input for current item or person tag capture.
+        Validate and process text input for current item, person tag capture, or date entry.
         
         States handled:
         - Item quantity entry: validate numeric, reject negative
         - Person tag capture (on Review screen): store any text
+        - Custom date entry for delivery / next_delivery
         
         Logs: input received, state, validation result, quantity/tag set.
         """
@@ -6362,99 +6448,89 @@ class OrderFlowHandler:
             self.logger.info(f"[{session.session_token}] Cancel requested during input")
             self._handle_cancel(chat_id, session.user_id)
             return
-        
-        # Check if we're in custom date input mode
-        if hasattr(session, '_date_input_mode') and session._date_input_mode:
+
+        # Custom date input mode
+        if getattr(session, "_date_input_mode", None):
             from datetime import datetime
             
             mode = session._date_input_mode
             self.logger.info(f"[{session.session_token}] Custom date input | mode={mode} text='{text}'")
-            
-            # Validate date format
+
             try:
-                selected_date = datetime.strptime(text, "%Y-%m-%d")
+                selected_dt = datetime.strptime(text, "%Y-%m-%d")
                 today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                 
-                if selected_date < today:
+                if selected_dt < today:
                     self.logger.warning(f"[{session.session_token}] Past date rejected | date={text}")
-                    self.bot.send_message(chat_id, "⚠️ Cannot select a past date. Please enter a valid date.")
+                    self.bot.send_message(chat_id, "Cannot select a past date. Enter a valid date (YYYY-MM-DD).")
                     return
                 
-                # Store date based on mode
                 if mode == "delivery":
                     session.delivery_date = text
                     session._date_input_mode = None
                     self.logger.info(f"[{session.session_token}] Custom delivery date stored | date={text}")
-                    
-                    # Show calendar for next delivery
+                    # Prompt for next delivery date
                     self._show_calendar_picker(session, "next_delivery")
-                
+
                 elif mode == "next_delivery":
                     # Validate next_delivery > delivery
-                    delivery_date = datetime.strptime(session.delivery_date, "%Y-%m-%d").date()
-                    if selected_date.date() <= delivery_date:
-                        self.logger.warning(f"[{session.session_token}] Next delivery not after delivery | next={text} delivery={session.delivery_date}")
+                    try:
+                        delivery_dt = datetime.strptime(session.delivery_date, "%Y-%m-%d").date()
+                    except Exception:
+                        self.logger.error(f"[{session.session_token}] Missing/invalid delivery_date when setting next_delivery")
+                        self.bot.send_message(chat_id, "Set a delivery date first.")
+                        return
+
+                    if selected_dt.date() <= delivery_dt:
+                        self.logger.warning(
+                            f"[{session.session_token}] Next delivery not after delivery | next={text} delivery={session.delivery_date}"
+                        )
                         self.bot.send_message(
                             chat_id,
-                            f"⚠️ Next delivery must be AFTER delivery date.\n"
-                            f"Delivery: {session.delivery_date}\n"
-                            f"Next delivery: {text} ❌\n\n"
-                            f"Please enter a later date."
+                            f"Next delivery must be after delivery date.\nDelivery: {session.delivery_date}\nNext delivery: {text}\nEnter a later date."
                         )
                         return
-                    
+
                     session.next_delivery_date = text
                     session._date_input_mode = None
                     self.logger.info(f"[{session.session_token}] Custom next delivery date stored | date={text}")
-                    
-                    # Show on-hand timing prompt
+                    # Prompt for on-hand timing
                     self._show_onhand_timing_prompt(session)
-                
+
                 return
                 
             except ValueError:
                 self.logger.warning(f"[{session.session_token}] Invalid custom date format | text='{text}'")
                 self.bot.send_message(
                     chat_id,
-                    "⚠️ Invalid date format. Please use YYYY-MM-DD\n"
-                    "Example: 2025-10-15\n\n"
-                    "Or type /cancel to go back"
+                    "Invalid date format. Use YYYY-MM-DD. Example: 2025-10-15\nOr type /cancel to go back."
                 )
                 return
- 
-        # Check if we're in submitter name input mode (index = -2)
+
+        # Submitter name input mode (index = -2)
         if session.index == -2:
             text_clean = text.strip()
-            
             if not text_clean:
                 self.logger.warning(f"[{session.session_token}] Empty submitter name rejected")
-                self.bot.send_message(chat_id, "⚠️ Name cannot be empty. Please enter your name.")
+                self.bot.send_message(chat_id, "Name cannot be empty. Enter your name.")
                 return
-            
+
             session.submitter_name = text_clean
             self.logger.info(f"[{session.session_token}] Submitter name captured | name='{session.submitter_name}'")
-            
-            # Now load items and begin entry
-        self._load_items_and_begin_entry(session)
-        return
 
-        # Check if we're on Review screen waiting for person tag
-        
-        # Check if we're on Review screen waiting for person tag
-        # (after Done was pressed, before Confirm)
-        # This is indicated by index >= len(items) but not yet confirmed
+            # Now load items and begin entry
+            self._load_items_and_begin_entry(session)
+            return
+
+        # Review screen: capture person tag (index past last item, pre-confirm)
         if session.index >= len(session.items):
-            # We're on Review screen - capture as person tag
             self.logger.info(f"[{session.session_token}] Capturing person tag on Review | tag='{text}'")
             session.person_tag = text
             session.update_activity()
-            
-            # Re-display Review with updated tag
             self._show_review_with_tag(session)
             return
         
-        # Otherwise we're in item entry mode
-        # Check for text commands
+        # Item entry mode: command shortcuts
         lower = text.lower()
         if lower in ["/back", "back"]:
             self._handle_back(chat_id, session.user_id)
@@ -6466,22 +6542,26 @@ class OrderFlowHandler:
             self._handle_done(chat_id, session.user_id)
             return
         elif lower in ["/cancel", "cancel"]:
+            # already handled at top, but keep guard to be explicit
             self._handle_cancel(chat_id, session.user_id)
             return
         
-        # Validate numeric input for item quantity
+        # Numeric quantity validation
         try:
-            qty = float(text)
+            # allow "1,234" style inputs
+            normalized = text.replace(",", "")
+            qty = float(normalized)
             if qty < 0:
                 raise ValueError("Negative quantity")
             
             item = session.get_current_item()
-            item_name = item['name'] if item else 'unknown'
+            item_name = item["name"] if item else "unknown"
             self.logger.info(f"[{session.session_token}] Valid quantity | qty={qty} item={item_name}")
+
             session.set_current_quantity(qty)
             session.index += 1
             
-            # Show next item or done
+            # Next step
             if session.index >= len(session.items):
                 self._handle_done(chat_id, session.user_id)
             else:
@@ -6491,10 +6571,11 @@ class OrderFlowHandler:
             self.logger.warning(f"[{session.session_token}] Invalid quantity input | text='{text}' error={e}")
             self.bot.send_message(
                 chat_id,
-                "❌ Please enter a valid number (0 or positive)\n"
-                "Or use: Back, Skip, Done, Cancel"
+                "Enter a valid number (0 or positive). You can also type Back, Skip, Done, or Cancel."
             )
+            # Re-show current item to keep user anchored
             self._show_current_item(session)
+
 
     def _handle_back(self, chat_id: int, user_id: int):
         """

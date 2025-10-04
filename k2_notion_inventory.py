@@ -21,6 +21,7 @@ Version: 2.0.0
 """
 
 import asyncio
+import uuid
 import json
 import logging
 import os
@@ -496,6 +497,85 @@ class ConversationState:
     def update_activity(self):
         """Update last activity timestamp"""
         self.last_activity = datetime.now()
+
+# ===== ORDER SESSION STATE =====
+
+@dataclass
+class OrderSession:
+    """
+    State for interactive /order flow.
+    Persists vendor, item index, user-entered quantities, optional person tag, and timestamps.
+    """
+    user_id: int
+    chat_id: int
+    session_token: str  # unique correlation ID for logging
+    vendor: str  # 'Avondale' or 'Commissary'
+    items: List[Dict[str, Any]]  # catalog items with name, unit, adu, current_qty
+    
+    # Date fields for delivery scheduling
+    delivery_date: Optional[str] = None  # Selected delivery date in YYYY-MM-DD format
+    next_delivery_date: Optional[str] = None  # Next expected delivery date in YYYY-MM-DD format
+    onhand_time_hint: Optional[str] = None  # 'morning' or 'night' - when on-hand was recorded
+    consumption_days: Optional[int] = None  # Computed consumption days
+    
+    # Legacy fields
+    order_date: str = ""  # Deprecated - use delivery_date instead
+    submitter_name: str = ""  # Person placing the order
+    
+    # Item navigation
+    index: int = 0
+    quantities: Dict[str, Optional[float]] = field(default_factory=dict)  # item_name -> qty or None
+    person_tag: str = ""  # optional @handle or free text
+    
+    # Session lifecycle
+    started_at: datetime = field(default_factory=datetime.now)
+    expires_at: datetime = field(default_factory=lambda: datetime.now() + timedelta(hours=2))
+    last_activity: datetime = field(default_factory=datetime.now)
+    last_message_id: Optional[int] = None
+    
+    # Input mode tracking
+    _date_input_mode: Optional[str] = None  # 'delivery' or 'next_delivery' for custom date entry
+    _calendar_month_offset: int = 0  # Offset from current month for calendar navigation
+    
+    def is_expired(self) -> bool:
+        """Check if session has exceeded timeout."""
+        return datetime.now() > self.expires_at
+    
+    def update_activity(self):
+        """Reset expiration timer on user activity."""
+        self.expires_at = datetime.now() + timedelta(hours=2)
+        self.last_activity = datetime.now()
+    
+    def get_current_item(self) -> Optional[Dict[str, Any]]:
+        """Retrieve current item dict or None if past end."""
+        if 0 <= self.index < len(self.items):
+            return self.items[self.index]
+        return None
+    
+    def move_back(self):
+        """Navigate to previous item (clamped at 0)."""
+        self.index = max(0, self.index - 1)
+    
+    def skip_current(self):
+        """Mark current item as skipped (None) and advance."""
+        item = self.get_current_item()
+        if item:
+            self.quantities[item['name']] = None
+        self.index += 1
+    
+    def set_current_quantity(self, qty: float):
+        """Record user-entered quantity for current item."""
+        item = self.get_current_item()
+        if item:
+            self.quantities[item['name']] = qty
+    
+    def get_progress(self) -> str:
+        """Return progress string like '3/12'."""
+        return f"{self.index + 1}/{len(self.items)}"
+    
+    def get_entered_count(self) -> int:
+        """Count items with non-None quantities."""
+        return sum(1 for v in self.quantities.values() if v is not None)
 
 # ===== NOTION DATABASE MANAGER =====
 
@@ -1293,7 +1373,7 @@ class NotionManager:
             location: Location name
             entry_type: 'on_hand' or 'received'
             date: Date in YYYY-MM-DD format
-            manager: Manager name (becomes page title)
+            manager: Submitter name (becomes page title and saved in Submitter property)
             notes: Optional notes
             quantities: Dict mapping item names to quantities
             image_file_id: Optional Telegram file ID for product image
@@ -1306,6 +1386,8 @@ class NotionManager:
             entry_type_display = "On-Hand Count" if entry_type == 'on_hand' else "Delivery Received"
             total_items = sum(1 for qty in quantities.values() if qty > 0)
             title = f"{manager} • {entry_type_display} • {date} • {location} ({total_items} items)"
+            
+            self.logger.info(f"Saving inventory transaction | location={location} type={entry_type} date={date} submitter='{manager}' items={total_items}")
             
             # Format quantities as readable JSON string for Notion
             quantities_summary = []
@@ -1340,6 +1422,15 @@ class NotionManager:
                     'select': {
                         'name': 'On-Hand' if entry_type == 'on_hand' else 'Received'
                     }
+                },
+                'Submitter': {  # New property for submitter name
+                    'rich_text': [
+                        {
+                            'text': {
+                                'content': manager
+                            }
+                        }
+                    ]
                 },
                 'Quantities': {  # Single rich text field with all quantities
                     'rich_text': [
@@ -1415,6 +1506,7 @@ class NotionManager:
                 image_note = " with image" if image_file_id else ""
                 self.logger.info(f"Saved inventory transaction: {title}{image_note}")
                 self.logger.info(f"Items recorded: {len([q for q in quantities.values() if q > 0])}")
+                self.logger.info(f"Submitter property saved: '{manager}'")
                 return True
             else:
                 self.logger.error(f"Failed to save inventory transaction")
@@ -1491,6 +1583,97 @@ class NotionManager:
                 self.logger.error(f"get_latest_inventory error: {e}", exc_info=True)
                 return {}
         
+    def get_latest_onhand_metadata(self, location: str) -> Optional[Dict]:
+        """
+        Get metadata from most recent On-Hand entry for location.
+        
+        Returns created_time, created_by, and flags for multiple recent entries.
+        
+        Args:
+            location: Location name
+            
+        Returns:
+            Optional[Dict]: {
+                'created_time': ISO timestamp,
+                'created_by': user name or ID,
+                'multiple_recent': bool (True if multiple entries within 12 hours)
+            } or None if no entries found
+            
+        Logs: query, results, metadata extraction
+        """
+        try:
+            self.logger.info(f"Getting latest on-hand metadata | location={location}")
+            
+            # Query for most recent On-Hand entries
+            query = {
+                "filter": {
+                    "and": [
+                        {"property": "Location", "select": {"equals": location}},
+                        {"property": "Type", "select": {"equals": "On-Hand"}},
+                    ]
+                },
+                "sorts": [{"property": "Date", "direction": "descending"}],
+                "page_size": 5,  # Get a few to check for duplicates
+            }
+            
+            response = self._make_request("POST", f"/databases/{self.inventory_db_id}/query", query)
+            
+            if not response or not response.get("results"):
+                self.logger.info(f"No on-hand entries found | location={location}")
+                return None
+            
+            pages = response["results"]
+            latest_page = pages[0]
+            
+            # Extract metadata
+            created_time = latest_page.get("created_time", "")
+            
+            # Get submitter from Submitter property (not system created_by)
+            props = latest_page.get("properties", {})
+            submitter_prop = props.get("Submitter", {})
+            
+            # Parse Submitter rich text field
+            user_name = "Unknown"
+            if submitter_prop.get("rich_text"):
+                submitter_text = "".join(
+                    segment.get("plain_text", "")
+                    for segment in submitter_prop["rich_text"]
+                ).strip()
+                if submitter_text:
+                    user_name = submitter_text
+            
+            self.logger.debug(f"Parsed submitter from property | submitter='{user_name}'")
+            
+            # Check for multiple recent entries (within 12 hours)
+            from datetime import datetime, timedelta
+            
+            multiple_recent = False
+            if len(pages) > 1:
+                try:
+                    latest_time = datetime.fromisoformat(created_time.replace('Z', '+00:00'))
+                    second_time = datetime.fromisoformat(pages[1].get("created_time", "").replace('Z', '+00:00'))
+                    
+                    time_diff = abs((latest_time - second_time).total_seconds() / 3600)
+                    if time_diff < 12:
+                        multiple_recent = True
+                        self.logger.info(f"Multiple recent entries detected | time_diff={time_diff:.1f}h")
+                except Exception as e:
+                    self.logger.warning(f"Error checking multiple entries | error={e}")
+            
+            metadata = {
+                'created_time': created_time,
+                'created_by': user_name,
+                'multiple_recent': multiple_recent
+            }
+            
+            self.logger.info(f"Latest on-hand metadata | location={location} created={created_time} by={user_name} multiple={multiple_recent}")
+            
+            return metadata
+            
+        except Exception as e:
+            self.logger.error(f"Error getting on-hand metadata | location={location} error={e}", exc_info=True)
+            return None
+    
     def get_missing_counts(self, location: str, date: str) -> List[str]:
         """
         Get list of items missing inventory counts for a specific date.
@@ -2042,6 +2225,7 @@ class TelegramBot:
 
         # THE ENTRY HANDLE
         self.entry_handler = EnhancedEntryHandler(self, notion_manager, calculator)
+        self.order_handler = OrderFlowHandler(self, notion_manager, calculator)
         
         # Rate limiting with exemptions
         self.user_commands: Dict[int, List[datetime]] = {}
@@ -2053,13 +2237,21 @@ class TelegramBot:
         self.retry_delay = 1.0
         
         # Chat configuration from environment
-        import os
         self.chat_config = {
             'onhand': int(os.environ.get('CHAT_ONHAND', '0')),
             'autorequest': int(os.environ.get('CHAT_AUTOREQUEST', '0')),
             'received': int(os.environ.get('CHAT_RECEIVED', '0')),
-            'reassurance': int(os.environ.get('CHAT_REASSURANCE', '0'))
+            'reassurance': int(os.environ.get('CHAT_REASSURANCE', '0')),
+            # Order prep chat routing (vendor-aware with fallback)
+            'prep_chat:default': os.environ.get('ORDER_PREP_CHAT_ID', '').strip(),
+            'prep_chat:Avondale': os.environ.get('ORDER_PREP_CHAT_ID_AVONDALE', '').strip(),
+            'prep_chat:Commissary': os.environ.get('ORDER_PREP_CHAT_ID_COMMISSARY', '').strip()
         }
+
+        # Log order prep chat configuration
+        self.logger.info(f"Order prep chat config loaded | default={self.chat_config.get('prep_chat:default', 'NOT_SET')} "
+                        f"avondale={self.chat_config.get('prep_chat:Avondale', 'NOT_SET')} "
+                        f"commissary={self.chat_config.get('prep_chat:Commissary', 'NOT_SET')}")
         
         # Test chat override
         self.use_test_chat = os.environ.get('USE_TEST_CHAT', 'false').lower() == 'true'
@@ -2068,6 +2260,58 @@ class TelegramBot:
         self.logger.info(f"Telegram bot initialized with enhanced error handling")
         if self.use_test_chat:
             self.logger.info(f"Test mode enabled - all messages will go to chat {self.test_chat}")
+
+    def _resolve_order_prep_chat(self, vendor: str, session_token: str) -> Optional[int]:
+        """
+        Resolve order prep chat ID with vendor-specific override and global fallback.
+        
+        Resolution order:
+        1. Vendor-specific: prep_chat:{vendor}
+        2. Global fallback: prep_chat:default
+        3. None (block with guidance)
+        
+        Args:
+            vendor: Vendor name (Avondale or Commissary)
+            session_token: Correlation token for logging
+            
+        Returns:
+            Optional[int]: Chat ID or None if unresolvable
+            
+        Logs: resolution attempts, fallback path, success/failure
+        """
+        self.logger.info(f"[{session_token}] Resolving order prep chat | vendor={vendor}")
+        
+        # Try vendor-specific first
+        vendor_key = f"prep_chat:{vendor}"
+        vendor_chat = self.chat_config.get(vendor_key, '').strip()
+        
+        if vendor_chat:
+            try:
+                chat_id = int(vendor_chat)
+                self.logger.info(f"[{session_token}] Resolved to vendor-specific chat | key={vendor_key} chat_id={chat_id}")
+                return chat_id
+            except ValueError:
+                self.logger.warning(f"[{session_token}] Invalid vendor-specific chat ID | key={vendor_key} value='{vendor_chat}'")
+        else:
+            self.logger.debug(f"[{session_token}] Vendor-specific chat not configured | key={vendor_key}")
+        
+        # Try global fallback
+        default_chat = self.chat_config.get('prep_chat:default', '').strip()
+        
+        if default_chat:
+            try:
+                chat_id = int(default_chat)
+                self.logger.info(f"[{session_token}] Resolved to global fallback chat | chat_id={chat_id}")
+                return chat_id
+            except ValueError:
+                self.logger.warning(f"[{session_token}] Invalid global fallback chat ID | value='{default_chat}'")
+        else:
+            self.logger.debug(f"[{session_token}] Global fallback not configured")
+        
+        # Nothing resolved
+        self.logger.error(f"[{session_token}] No order prep chat resolvable | vendor={vendor} | "
+                        f"Set ORDER_PREP_CHAT_ID or ORDER_PREP_CHAT_ID_{vendor.upper()} in .env")
+        return None
 
     # ===== CONVERSATION STATE MANAGEMENT =====
     
@@ -2520,6 +2764,7 @@ class TelegramBot:
                 # Periodic cleanup
                 self._cleanup_stale_conversations()
                 self.entry_handler.cleanup_expired_sessions()
+                self.order_handler.cleanup_expired_sessions()
                 # Get updates
                 updates = self.get_updates(timeout=25)
                 
@@ -2551,19 +2796,24 @@ class TelegramBot:
         self.logger.info("Telegram bot stopping...")
 
     # ===== UPDATE PROCESSING =====
-    
+ 
     def _process_update(self, update: Dict):
         """
-        Process update with proper routing for entry wizard input including photos.
+        Process update with proper routing for entry wizard, order flow, and other inputs.
         """
         try:
             # Handle callback queries
             if "callback_query" in update:
                 callback_data = update["callback_query"].get("data", "")
                 
-                # Route entry callbacks to entry handler
+                # Route entry callbacks
                 if callback_data.startswith("entry_"):
                     self.entry_handler.handle_callback(update["callback_query"])
+                    return
+                
+                # Route order callbacks
+                if callback_data.startswith("order_"):
+                    self.order_handler.handle_callback(update["callback_query"])
                     return
                 
                 # Handle other callbacks
@@ -2578,17 +2828,22 @@ class TelegramBot:
             chat_id = message["chat"]["id"]
             user_id = message["from"]["id"]
             
-            # IMPORTANT: Check for entry session BEFORE command processing
-            # This allows number input AND photo input to work during entry
+            # Check for active order session BEFORE command processing
+            if hasattr(self, 'order_handler') and user_id in self.order_handler.sessions:
+                session = self.order_handler.sessions[user_id]
+                if not session.is_expired():
+                    if 'text' in message:
+                        self.order_handler.handle_text_input(message, session)
+                        return
+            
+            # Check for entry session
             if hasattr(self, 'entry_handler') and user_id in self.entry_handler.sessions:
                 session = self.entry_handler.sessions[user_id]
                 if not session.is_expired():
-                    # Handle photo messages - same approach as communication bot
                     if 'photo' in message:
                         if session.mode == "received" and session.current_step == "image":
                             self.entry_handler.handle_photo_input(message, session)
                         return
-                    # Handle text input (including numbers)
                     elif 'text' in message:
                         self.entry_handler.handle_text_input(message, session)
                         return
@@ -2633,8 +2888,7 @@ class TelegramBot:
                                     "⚠️ An error occurred. Please try again.")
             except:
                 pass
-
-    
+        
     def _route_command(self, message: Dict, command: str):
         """Route commands to appropriate handlers."""
         handlers = {
@@ -2642,7 +2896,7 @@ class TelegramBot:
             "/help": self._handle_help,
             "/entry": self.entry_handler.handle_entry_command,
             "/info": self._handle_info,
-            "/order": self._handle_order,
+            "/order": self.order_handler.handle_order_command,
             "/order_avondale": self._handle_order_avondale,
             "/order_commissary": self._handle_order_commissary,
             "/reassurance": self._handle_reassurance,
@@ -3178,6 +3432,7 @@ class TelegramBot:
         Returns True if this function fully handled the message; False to let your original logic run.
         """
         chat_id = state.chat_id
+        user_id = message.get("from", {}).get("id")
         text = (message.get("text") or "").strip()
         low = text.lower()
         state.update_activity()
@@ -3187,7 +3442,7 @@ class TelegramBot:
             self._handle_cancel(message)
             return True
 
-        if user_id in self.entry_handler.sessions:
+        if user_id and user_id in self.entry_handler.sessions:
             session = self.entry_handler.sessions[user_id]
             self.entry_handler.handle_text_input(message, session)
             return
@@ -3509,374 +3764,42 @@ class TelegramBot:
             self.logger.error(f"/info failed: {e}", exc_info=True)
             self.send_message(chat_id, "⚠️ Unable to generate dashboard. Please try again.")
 
-
-    def _handle_order(self, message: Dict):
-        """
-        Generate combined purchase orders with team notification format.
-        """
-        import math
-        chat_id = message["chat"]["id"]
-        
-        def format_order_section(location: str, summary: dict, emoji: str) -> str:
-            """Format order section with clean layout."""
-            delivery = summary.get("delivery_date", "—")
-            requests = summary.get("requests", [])
-            cycle = summary.get("order_cycle", {})
-            
-            # Calculate totals by unit type
-            totals = {}
-            order_lines = []
-            
-            for item in requests:
-                qty = item.get("requested_qty", 0)
-                if qty <= 0:
-                    continue
-                    
-                name = item.get("item_name", "Unknown")
-                unit = item.get("unit_type", "unit")
-                current = float(item.get("current_qty", 0))
-                oh_delivery = float(item.get("oh_at_delivery", 0))
-                need = float(item.get("consumption_need", 0))
-                
-                totals[unit] = totals.get(unit, 0) + qty
-                order_lines.append({
-                    'qty': qty,
-                    'name': name,
-                    'unit': unit,
-                    'current': current,
-                    'oh_delivery': oh_delivery,
-                    'need': need
-                })
-            
-            # Sort by quantity descending
-            order_lines.sort(key=lambda x: x['qty'], reverse=True)
-            
-            # Build section text
-            text = f"{emoji} <b>{location.upper()} ORDER</b>\n"
-            text += f"📅 Delivery: {delivery}\n"
-            
-            if not order_lines:
-                text += "✅ No items needed\n"
-                return text
-            
-            # Totals summary
-            text += "📦 Totals: "
-            text += " • ".join(f"{v} {k}" for k, v in sorted(totals.items()))
-            text += f"\n\n"
-            
-            # Item list (compact for mobile)
-            for item in order_lines[:10]:
-                text += f"<b>{item['qty']} {item['unit']}</b> — {item['name']}\n"
-                # Show burn-down if significant
-                if abs(item['current'] - item['oh_delivery']) > 0.1:
-                    text += f"  {item['current']:.1f} now → {item['oh_delivery']:.1f} at delivery\n"
-                else:
-                    text += f"  Current: {item['current']:.1f} • Need: {item['need']:.1f}\n"
-            
-            if len(order_lines) > 10:
-                text += f"<i>...and {len(order_lines) - 10} more items</i>\n"
-            
-            return text
-        
-        try:
-            avondale = self.calc.generate_auto_requests("Avondale")
-            commissary = self.calc.generate_auto_requests("Commissary")
-            self._save_order_to_notion("Avondale", avondale)
-            self._save_order_to_notion("Commissary", commissary)
-        
-
-            
-            text = (
-                "📋 <b>PURCHASE ORDERS</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            )
-            
-            text += format_order_section("Avondale", avondale, "🏪")
-            text += "\n" + ("─" * 28) + "\n\n"
-            text += format_order_section("Commissary", commissary, "🏭")
-            
-            # Team messages
-            text += (
-                "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "📱 <b>Team Messages:</b>\n\n"
-            )
-            
-            # Avondale team message if items needed
-            if avondale.get("requests"):
-                a_delivery = avondale.get("delivery_date", "")
-                a_totals = {}
-                for item in avondale.get("requests", []):
-                    unit = item.get("unit_type", "unit")
-                    qty = item.get("requested_qty", 0)
-                    a_totals[unit] = a_totals.get(unit, 0) + qty
-                
-                a_summary = " • ".join(f"{v} {k}" for k, v in sorted(a_totals.items()))
-                text += f"<i>Avondale team: Please order {a_summary} for {a_delivery} delivery.</i>\n\n"
-            
-            # Commissary team message if items needed
-            if commissary.get("requests"):
-                c_delivery = commissary.get("delivery_date", "")
-                c_totals = {}
-                for item in commissary.get("requests", []):
-                    unit = item.get("unit_type", "unit")
-                    qty = item.get("requested_qty", 0)
-                    c_totals[unit] = c_totals.get(unit, 0) + qty
-                
-                c_summary = " • ".join(f"{v} {k}" for k, v in sorted(c_totals.items()))
-                text += f"<i>Commissary team: Please order {c_summary} for {c_delivery} delivery.</i>\n"
-            
-            text += (
-                "\n💡 Orders account for consumption to delivery\n"
-                "• /order_avondale • /order_commissary"
-            )
-            
-            self.send_message(chat_id, text)
-            self.logger.info(f"/order sent successfully")
-            
-        except Exception as e:
-            self.logger.error(f"/order failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate orders. Please try again.")
-
     def _handle_order_avondale(self, message: Dict):
         """
-        Avondale order with header info and clean request-style list.
+        Compatibility wrapper for /order_avondale command.
+        Delegates to interactive order flow with Avondale preselected.
+        
+        Logs: command entry, delegation to order handler.
         """
-        import math
-        from datetime import datetime
         chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        
+        self.logger.info(f"/order_avondale command | user={user_id} chat={chat_id} | delegating to interactive flow")
         
         try:
-            summary = self.calc.generate_auto_requests("Avondale")
-            self._save_order_to_notion("Avondale", summary)
-            delivery = summary.get("delivery_date", "—")
-            requests = summary.get("requests", [])
-            cycle = summary.get("order_cycle", {})
-            
-            # Process and sort orders
-            orders = []
-            totals = {}
-            
-            for item in requests:
-                qty = item.get("requested_qty", 0)
-                if qty <= 0:
-                    continue
-                
-                unit = item.get("unit_type", "unit")
-                totals[unit] = totals.get(unit, 0) + qty
-                
-                orders.append({
-                    'qty': qty,
-                    'name': item.get("item_name", "Unknown"),
-                    'unit': unit,
-                    'current': float(item.get("current_qty", 0)),
-                    'oh_delivery': float(item.get("oh_at_delivery", 0)),
-                    'need': float(item.get("consumption_need", 0))
-                })
-            
-            orders.sort(key=lambda x: x['qty'], reverse=True)
-            
-            # Build message header
-            text = (
-                "🏪 <b>AVONDALE PURCHASE ORDER</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📅 Delivery Date: {delivery}\n"
-            )
-            
-            # Show order timing
-            if cycle:
-                days_pre = cycle.get('days_pre', 0)
-                days_post = cycle.get('days_post', 0)
-                text += (
-                    f"📊 Order Window:\n"
-                    f"  • Burn-down days: {days_pre}\n"
-                    f"  • Coverage days: {days_post}\n"
-                )
-            
-            text += f"📦 Items to Order: {len(orders)}\n\n"
-            
-            if orders:
-                # Order summary by unit type
-                text += "📊 <b>Order Summary</b>\n"
-                for unit, total in sorted(totals.items(), key=lambda x: (-x[1], x[0])):
-                    text += f"  • {total} {unit}{'s' if total > 1 else ''}\n"
-                
-                # Request-style message format
-                text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                text += f"📋 <b>ORDER REQUEST - AVONDALE</b>\n"
-                
-                # Get current day
-                now = get_time_in_timezone(BUSINESS_TIMEZONE)
-                text += f"📅 {now.strftime('%a %b %d, %Y')}\n\n"
-                
-                # Delivery day from date
-                try:
-                    delivery_date = datetime.strptime(delivery, '%Y-%m-%d')
-                    delivery_day = delivery_date.strftime('%A')
-                except:
-                    delivery_day = "delivery"
-                
-                text += (
-                    f"Hey Avondale Prep Team! This is what we need for {delivery_day} Delivery.\n"
-                    f"Please confirm at your earliest convenience:\n\n"
-                )
-                
-                # Clean item list
-                for item in orders:
-                    # Format: • Item Name: X units
-                    plural = 's' if item['qty'] > 1 else ''
-                    # Handle unit pluralization properly
-                    if item['unit'] == 'case':
-                        unit_plural = 'cases' if item['qty'] > 1 else 'case'
-                    elif item['unit'] == 'bag':
-                        unit_plural = 'bags' if item['qty'] > 1 else 'bag'
-                    elif item['unit'] == 'tray':
-                        unit_plural = 'trays' if item['qty'] > 1 else 'tray'
-                    elif item['unit'] == 'bottle':
-                        unit_plural = 'bottles' if item['qty'] > 1 else 'bottle'
-                    elif item['unit'] == 'quart':
-                        unit_plural = 'quarts' if item['qty'] > 1 else 'quart'
-                    else:
-                        unit_plural = item['unit'] + plural
-                    
-                    text += f"• {item['name']}: {item['qty']} {unit_plural}\n"
-                
-                text += f"\nTotal items: {len(orders)}"
-                
-            else:
-                text += (
-                    "✅ <b>No Orders Needed</b>\n\n"
-                    "All inventory levels are sufficient\n"
-                    "through the next delivery cycle."
-                )
-            
-            self.send_message(chat_id, text)
-            self.logger.info(f"/order_avondale sent - {len(orders)} items")
-            
+            self.order_handler.handle_preselected_vendor_command(message, "Avondale")
         except Exception as e:
-            self.logger.error(f"/order_avondale failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate Avondale order. Please try again.")
-
+            self.logger.error(f"/order_avondale delegation failed | error={e}", exc_info=True)
+            self.send_message(chat_id, "⚠️ Unable to start order flow. Please try /order or contact support.")
 
     def _handle_order_commissary(self, message: Dict):
         """
-        Commissary order with header info and clean request-style list.
+        Compatibility wrapper for /order_commissary command.
+        Delegates to interactive order flow with Commissary preselected.
+        
+        Logs: command entry, delegation to order handler.
         """
-        import math
-        from datetime import datetime
         chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        
+        self.logger.info(f"/order_commissary command | user={user_id} chat={chat_id} | delegating to interactive flow")
         
         try:
-            summary = self.calc.generate_auto_requests("Commissary")
-            self._save_order_to_notion("Commissary", summary)
-            
-            delivery = summary.get("delivery_date", "—")
-            requests = summary.get("requests", [])
-            cycle = summary.get("order_cycle", {})
-            
-            # Process and sort orders
-            orders = []
-            totals = {}
-            
-            for item in requests:
-                qty = item.get("requested_qty", 0)
-                if qty <= 0:
-                    continue
-                
-                unit = item.get("unit_type", "unit")
-                totals[unit] = totals.get(unit, 0) + qty
-                
-                orders.append({
-                    'qty': qty,
-                    'name': item.get("item_name", "Unknown"),
-                    'unit': unit,
-                    'current': float(item.get("current_qty", 0)),
-                    'oh_delivery': float(item.get("oh_at_delivery", 0)),
-                    'need': float(item.get("consumption_need", 0))
-                })
-            
-            orders.sort(key=lambda x: x['qty'], reverse=True)
-            
-            # Build message header
-            text = (
-                "🏭 <b>COMMISSARY PURCHASE ORDER</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📅 Delivery Date: {delivery}\n"
-            )
-            
-            # Show order timing
-            if cycle:
-                days_pre = cycle.get('days_pre', 0)
-                days_post = cycle.get('days_post', 0)
-                text += (
-                    f"📊 Order Window:\n"
-                    f"  • Burn-down days: {days_pre}\n"
-                    f"  • Coverage days: {days_post}\n"
-                )
-            
-            text += f"📦 Items to Order: {len(orders)}\n\n"
-            
-            if orders:
-                # Order summary by unit type
-                text += "📊 <b>Order Summary</b>\n"
-                for unit, total in sorted(totals.items(), key=lambda x: (-x[1], x[0])):
-                    text += f"  • {total} {unit}{'s' if total > 1 else ''}\n"
-                
-                # Request-style message format
-                text += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                text += f"📋 <b>ORDER REQUEST - COMMISSARY</b>\n"
-                
-                # Get current day
-                now = get_time_in_timezone(BUSINESS_TIMEZONE)
-                text += f"📅 {now.strftime('%a %b %d, %Y')}\n\n"
-                
-                # Delivery day from date
-                try:
-                    delivery_date = datetime.strptime(delivery, '%Y-%m-%d')
-                    delivery_day = delivery_date.strftime('%A')
-                except:
-                    delivery_day = "delivery"
-                
-                text += (
-                    f"Hey Commissary Prep Team! This is what we need for {delivery_day} Delivery.\n"
-                    f"Please confirm at your earliest convenience:\n\n"
-                )
-                
-                # Clean item list
-                for item in orders:
-                    # Format: • Item Name: X units
-                    plural = 's' if item['qty'] > 1 else ''
-                    # Handle unit pluralization properly
-                    if item['unit'] == 'case':
-                        unit_plural = 'cases' if item['qty'] > 1 else 'case'
-                    elif item['unit'] == 'bag':
-                        unit_plural = 'bags' if item['qty'] > 1 else 'bag'
-                    elif item['unit'] == 'tray':
-                        unit_plural = 'trays' if item['qty'] > 1 else 'tray'
-                    elif item['unit'] == 'bottle':
-                        unit_plural = 'bottles' if item['qty'] > 1 else 'bottle'
-                    elif item['unit'] == 'quart':
-                        unit_plural = 'quarts' if item['qty'] > 1 else 'quart'
-                    else:
-                        unit_plural = item['unit'] + plural
-                    
-                    text += f"• {item['name']}: {item['qty']} {unit_plural}\n"
-                
-                text += f"\nTotal items: {len(orders)}"
-                
-            else:
-                text += (
-                    "✅ <b>No Orders Needed</b>\n\n"
-                    "All inventory levels are sufficient\n"
-                    "through the next delivery cycle."
-                )
-            
-            self.send_message(chat_id, text)
-            self.logger.info(f"/order_commissary sent - {len(orders)} items")
-            
+            self.order_handler.handle_preselected_vendor_command(message, "Commissary")
         except Exception as e:
-            self.logger.error(f"/order_commissary failed: {e}", exc_info=True)
-            self.send_message(chat_id, "⚠️ Unable to generate Commissary order. Please try again.")
- 
+            self.logger.error(f"/order_commissary delegation failed | error={e}", exc_info=True)
+            self.send_message(chat_id, "⚠️ Unable to start order flow. Please try /order or contact support.")
+
     def _handle_reassurance(self, message: Dict):
         """
         Daily risk assessment with FIXED consumption math.
@@ -4088,15 +4011,16 @@ class EntrySession:
     """
     user_id: int
     chat_id: int
-    mode: str  # 'on_hand' or 'received'
-    location: str  # 'Avondale' or 'Commissary'
-    items: List[Dict[str, Any]]  # List of items with metadata
+    vendor: str = ""  # 'Avondale' or 'Commissary'
+    mode: str = ""  # 'on_hand' or 'received'
+    location: str = ""  # Deprecated, use vendor instead
+    items: List[Dict[str, Any]] = field(default_factory=list)  # List of items with metadata
     index: int = 0  # Current item index
     answers: Dict[str, Optional[float]] = field(default_factory=dict)  # item_name -> quantity
     started_at: datetime = field(default_factory=datetime.now)
     expires_at: datetime = field(default_factory=lambda: datetime.now() + timedelta(hours=2))
     last_message_id: Optional[int] = None
-    manager_name: str = "Manager"
+    submitter_name: str = ""  # Captured from Telegram or user input
     notes: str = ""
     image_file_id: Optional[str] = None  # Telegram file ID for product image
     current_step: str = "items"  # Track if we're on items or image step
@@ -4161,56 +4085,336 @@ class EnhancedEntryHandler:
         self.calc = calculator
         self.logger = logging.getLogger('entry_wizard')
         self.sessions: Dict[int, EntrySession] = {}
+        self.posted_entry_hashes: Dict[str, datetime] = {}  # hash -> timestamp for idempotency
+        self._temp_messages: Dict[int, Dict] = {}  # Temporary storage for messages
+    
+    def _get_telegram_display_name(self, message: Dict) -> str:
+        """
+        Extract display name from Telegram message.
+        
+        Priority: first_name + last_name > username > "Unknown"
+        
+        Args:
+            message: Telegram message object
+            
+        Returns:
+            str: Display name
+            
+        Logs: extraction result
+        """
+        user = message.get("from", {})
+        
+        first_name = user.get("first_name", "").strip()
+        last_name = user.get("last_name", "").strip()
+        username = user.get("username", "").strip()
+        
+        if first_name or last_name:
+            display_name = f"{first_name} {last_name}".strip()
+        elif username:
+            display_name = f"@{username}"
+        else:
+            display_name = "Unknown"
+        
+        self.logger.debug(f"Extracted Telegram display name | name='{display_name}' user_id={user.get('id')}")
+        
+        return display_name
     
     def handle_entry_command(self, message: Dict):
         """
-        Handle /entry command - check for existing session first.
+        Entry point for /entry command.
+        Start with vendor selection (same as order flow).
+        
+        Logs: command entry, session check, vendor prompt.
         """
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
+        
+        self.logger.info(f"/entry command entry | user={user_id} chat={chat_id}")
         
         # Check for existing session
         if user_id in self.sessions:
             session = self.sessions[user_id]
             if not session.is_expired():
-                # Offer to resume or start over
+                self.logger.info(f"Active entry session found | vendor={session.vendor} mode={session.mode}")
+                # Offer resume or restart
                 keyboard = self._create_keyboard([
                     [("📂 Resume", "entry_resume"), ("🔄 Start Over", "entry_new")],
                     [("❌ Cancel", "entry_cancel_existing")]
                 ])
                 
-                progress = session.get_progress()
                 mode_text = "On-Hand Count" if session.mode == "on_hand" else "Delivery"
+                progress = f"{session.index + 1}/{len(session.items)}" if session.items else "0/0"
                 
                 self.bot.send_message(
                     chat_id,
-                    f"📋 <b>Active Session Found</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Type: {mode_text} for {session.location}\n"
+                    f"📋 <b>Active Entry Session</b>\n"
+                    f"────────────────────────────\n"
+                    f"Type: {mode_text} for {session.vendor}\n"
                     f"Progress: {progress} • Answered: {session.get_answered_count()}\n\n"
                     f"What would you like to do?",
                     reply_markup=keyboard
                 )
                 return
         
-        # No active session - start new
-        self._start_new_entry(chat_id, user_id)
+        # No active session - start vendor selection
+        self.logger.info(f"No active session | starting vendor selection")
+        self._start_vendor_selection(chat_id, user_id, message)
     
-    def _start_new_entry(self, chat_id: int, user_id: int):
-        """Start new entry session."""
+    def _start_vendor_selection(self, chat_id: int, user_id: int, message: Dict = None):
+        """
+        Prompt user to select vendor (Avondale or Commissary).
+        Store message for later display name extraction.
+        
+        Logs: vendor selection prompt.
+        """
+        self.logger.info(f"Prompting vendor selection for entry | user={user_id}")
+        
+        # Store message for later display name extraction
+        if message:
+            self._temp_messages[user_id] = message
+        
         keyboard = self._create_keyboard([
-            [("🏪 Avondale", "entry_loc|Avondale")],
-            [("🏭 Commissary", "entry_loc|Commissary")],
+            [("🏪 Avondale", "entry_vendor|Avondale")],
+            [("🏭 Commissary", "entry_vendor|Commissary")],
             [("❌ Cancel", "entry_cancel")]
         ])
         
         self.bot.send_message(
             chat_id,
-            "📝 <b>Inventory Entry Wizard</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📋 <b>Inventory Entry</b>\n"
+            "────────────────────────────\n"
             "Select location:",
             reply_markup=keyboard
         )
+    
+    def _handle_vendor_callback(self, chat_id: int, user_id: int, vendor: str):
+        """
+        Handle vendor selection, then show mode selection (on-hand vs received).
+        
+        Logs: vendor selected, mode prompt.
+        """
+        self.logger.info(f"Vendor selected for entry | vendor={vendor} user={user_id}")
+        
+        # Create session with vendor
+        session = EntrySession(
+            user_id=user_id,
+            chat_id=chat_id,
+            vendor=vendor,
+            location=vendor  # Set both for compatibility
+        )
+        self.sessions[user_id] = session
+        self.logger.info(f"Entry session created | vendor={vendor} user={user_id}")
+        
+        # Show mode selection
+        keyboard = self._create_keyboard([
+            [("📦 On-Hand Count", "entry_mode|on_hand")],
+            [("📥 Received Delivery", "entry_mode|received")],
+            [("❌ Cancel", "entry_cancel")]
+        ])
+        
+        self.bot.send_message(
+            chat_id,
+            f"📍 Location: <b>{vendor}</b>\n\n"
+            f"Select entry type:",
+            reply_markup=keyboard
+        )
+    
+    def _handle_mode_selection(self, chat_id: int, user_id: int, mode: str):
+        """
+        Handle mode selection and prompt for submitter name.
+        
+        Args:
+            mode: 'on_hand' or 'received'
+            
+        Logs: mode selected, submitter prompt.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for mode selection | user={user_id}")
+            self.bot.send_message(chat_id, "Session expired. Use /entry to start over.")
+            return
+        
+        session.mode = mode
+        self.logger.info(f"Entry mode selected | mode={mode} vendor={session.vendor} user={user_id}")
+        
+        # Extract Telegram display name
+        message = self._temp_messages.get(user_id)
+        if message:
+            display_name = self._get_telegram_display_name(message)
+        else:
+            display_name = "Unknown"
+        
+        # Show submitter prompt
+        self._show_submitter_prompt(session, display_name)
+    
+    def _show_submitter_prompt(self, session: EntrySession, prefill_name: str):
+        """
+        Prompt user to enter their name (simplified flow).
+        
+        Args:
+            session: Entry session
+            prefill_name: Extracted Telegram display name (ignored, user types their name)
+            
+        Logs: submitter prompt
+        """
+        mode_text = "On-Hand Count" if session.mode == "on_hand" else "Delivery"
+        
+        self.logger.info(f"Showing submitter prompt | vendor={session.vendor} user={session.user_id}")
+        
+        # Set flag to indicate we're waiting for name input
+        session.current_step = "submitter"
+        
+        self.bot.send_message(
+            session.chat_id,
+            f"📍 {session.vendor} • {mode_text}\n"
+            f"────────────────────────────\n\n"
+            f"👤 <b>Enter Your Name</b>\n\n"
+            f"Type your name to continue.\n"
+            f"Or type /cancel to exit."
+        )
+    
+    def _load_items_and_begin_entry(self, session: EntrySession):
+        """
+        Load catalog items and begin item entry loop.
+        Previously this logic was inline in _handle_mode_selection.
+        
+        Logs: catalog load, item count, first item display.
+        """
+        # Load items for vendor
+        items = self.notion.get_items_for_location(session.vendor)
+        session.items = [
+            {
+                'name': item.name,
+                'unit': item.unit_type,
+                'adu': item.adu,
+                'id': item.id
+            }
+            for item in items
+        ]
+        
+        if not session.items:
+            self.logger.warning(f"No items found for entry | vendor={session.vendor}")
+            self.bot.send_message(session.chat_id, f"⚠️ No items found for {session.vendor}")
+            self._delete_session(session.user_id)
+            return
+        
+        # Initialize answers dict
+        for item in session.items:
+            session.answers[item['name']] = None
+        
+        # Reset index to start item entry
+        session.index = 0
+        
+        self.logger.info(f"Items loaded for entry | vendor={session.vendor} count={len(session.items)} submitter={session.submitter_name}")
+        
+        # Start item entry
+        mode_text = "On-Hand Count" if session.mode == "on_hand" else "Delivery"
+        date = datetime.now().strftime('%Y-%m-%d')
+        
+        self.bot.send_message(
+            session.chat_id,
+            f"📍 <b>{session.vendor} • {mode_text}</b>\n"
+            f"📅 Date: {date}\n"
+            f"👤 Submitter: {session.submitter_name}\n"
+            f"📦 Items: {len(session.items)}\n"
+            f"────────────────────────────\n\n"
+            f"Enter quantity for each item.\n"
+            f"You can use: back, skip, done, cancel"
+        )
+        
+        self._show_current_item(session)
+    
+    def _compute_entry_hash(self, vendor: str, entry_type: str, date: str, 
+                            quantities: Dict[str, float], submitter: str = "Unknown") -> str:
+        """
+        Compute SHA-256 hash for entry idempotency check.
+        
+        Hash inputs: vendor, entry_type, date, submitter, sorted (item_name, qty) tuples
+        
+        Args:
+            vendor: Vendor name
+            entry_type: 'on_hand' or 'received'
+            date: Date in YYYY-MM-DD format
+            quantities: Dict of item_name -> quantity
+            submitter: Submitter name/handle
+            
+        Returns:
+            str: Hex digest of SHA-256 hash
+            
+        Logs: hash computation with input summary
+        """
+        import hashlib
+        import json
+        
+        # Sort items for deterministic hash
+        sorted_items = sorted(
+            [(name, qty) for name, qty in quantities.items() if qty is not None and qty > 0],
+            key=lambda x: x[0]
+        )
+        
+        # Build hash input
+        hash_input = {
+            'vendor': vendor,
+            'entry_type': entry_type,
+            'date': date,
+            'submitter': submitter,
+            'items': sorted_items
+        }
+        
+        # Compute hash
+        hash_str = json.dumps(hash_input, sort_keys=True)
+        hash_digest = hashlib.sha256(hash_str.encode('utf-8')).hexdigest()
+        
+        self.logger.debug(f"Entry hash computed | hash={hash_digest[:16]}... items={len(sorted_items)}")
+        
+        return hash_digest
+    
+    def _build_entry_review_message(self, session: EntrySession, date: str, 
+                                    submitter: str = "Unknown") -> str:
+        """
+        Build minimal entry review message for prep chat posting.
+        
+        Format:
+        Submitter (if present)
+        Entry Type • Date
+        • qty × item lines
+        
+        Args:
+            session: Entry session
+            date: Entry date
+            submitter: Submitter name/handle
+            
+        Returns:
+            str: Formatted message
+            
+        Logs: message build
+        """
+        entry_type_display = "On-Hand Count" if session.mode == "on_hand" else "Received Delivery"
+        
+        # Build message
+        text = ""
+        
+        # Submitter on first line if present
+        if submitter and submitter != "Unknown":
+            text += f"{submitter}\n"
+        
+        text += f"{entry_type_display} • {date}\n"
+        
+        # Items
+        entered_items = []
+        for item in session.items:
+            qty = session.answers.get(item['name'])
+            if qty is not None and qty > 0:
+                entered_items.append(f"• {qty} × {item['name']}")
+        
+        if entered_items:
+            text += "\n".join(entered_items)
+        else:
+            text += "• No items recorded"
+        
+        self.logger.debug(f"Entry review message built | items={len(entered_items)} submitter={submitter}")
+        
+        return text
     
     def handle_callback(self, callback_query: Dict):
         """Handle all entry-related callbacks."""
@@ -4223,18 +4427,24 @@ class EnhancedEntryHandler:
         self.bot._make_request("answerCallbackQuery", 
                               {"callback_query_id": callback_query.get("id")})
         
+        # Route vendor selection
+        if data.startswith("entry_vendor|"):
+            vendor = data.split("|")[1]
+            self._handle_vendor_callback(chat_id, user_id, vendor)
+            return
+        
+        # Route mode selection
+        if data.startswith("entry_mode|"):
+            mode = data.split("|")[1]
+            self._handle_mode_selection(chat_id, user_id, mode)
+            return
+        
         # Route callbacks
         if data == "entry_resume":
             self._resume_session(chat_id, user_id)
         elif data == "entry_new":
             self._delete_session(user_id)
-            self._start_new_entry(chat_id, user_id)
-        elif data.startswith("entry_loc|"):
-            location = data.split("|")[1]
-            self._handle_location_selection(chat_id, user_id, location)
-        elif data.startswith("entry_mode|"):
-            mode = data.split("|")[1]
-            self._handle_mode_selection(chat_id, user_id, mode)
+            self._start_vendor_selection(chat_id, user_id)
         elif data == "entry_back":
             self._handle_back(chat_id, user_id)
         elif data == "entry_skip":
@@ -4263,7 +4473,31 @@ class EnhancedEntryHandler:
         # Update session activity
         session.update_activity()
         
-        # Check for special text commands first
+        # Check for cancel command FIRST (works in all input modes)
+        if text.lower() in ["/cancel", "cancel"]:
+            self.logger.info(f"Cancel requested during entry | user={session.user_id}")
+            self._handle_cancel(chat_id, session.user_id)
+            return
+        
+        # Check if we're in submitter name input mode
+        if hasattr(session, 'current_step') and session.current_step == "submitter":
+            text_clean = sanitize_user_input(text, 100).strip()
+            
+            if not text_clean:
+                self.logger.warning(f"Empty submitter name rejected | user={session.user_id}")
+                self.bot.send_message(session.chat_id, "⚠️ Name cannot be empty. Please enter your name.")
+                return
+            
+            # Store submitter name
+            session.submitter_name = text_clean
+            self.logger.info(f"Submitter name captured | name='{session.submitter_name}' user={session.user_id}")
+            
+            # Clear step flag and proceed to load items
+            session.current_step = "items"
+            self._load_items_and_begin_entry(session)
+            return
+        
+        # Check for special text commands
         if text.lower() in ["/back", "back"]:
             self._handle_back(chat_id, session.user_id)
             return
@@ -4272,9 +4506,6 @@ class EnhancedEntryHandler:
             return
         elif text.lower() in ["/done", "done"]:
             self._handle_done(chat_id, session.user_id)
-            return
-        elif text.lower() in ["/cancel", "cancel"]:
-            self._handle_cancel(chat_id, session.user_id)
             return
         
         # Check if we're in image step
@@ -4342,80 +4573,6 @@ class EnhancedEntryHandler:
 
 
     
-    def _handle_location_selection(self, chat_id: int, user_id: int, location: str):
-        """Handle location selection."""
-        # Create session
-        session = EntrySession(
-            user_id=user_id,
-            chat_id=chat_id,
-            location=location,
-            mode="",
-            items=[]
-        )
-        self.sessions[user_id] = session
-        
-        # Show mode selection
-        keyboard = self._create_keyboard([
-            [("📦 On-Hand Count", "entry_mode|on_hand")],
-            [("📥 Received Delivery", "entry_mode|received")],
-            [("❌ Cancel", "entry_cancel")]
-        ])
-        
-        self.bot.send_message(
-            chat_id,
-            f"📍 Location: <b>{location}</b>\n\n"
-            f"Select entry type:",
-            reply_markup=keyboard
-        )
-    
-    def _handle_mode_selection(self, chat_id: int, user_id: int, mode: str):
-        """Handle mode selection and start item entry."""
-        session = self.sessions.get(user_id)
-        if not session:
-            self.bot.send_message(chat_id, "Session expired. Use /entry to start over.")
-            return
-        
-        session.mode = mode
-        
-        # Load items for location
-        items = self.notion.get_items_for_location(session.location)
-        session.items = [
-            {
-                'name': item.name,
-                'unit': item.unit_type,
-                'adu': item.adu,
-                'id': item.id
-            }
-            for item in items
-        ]
-        
-        if not session.items:
-            self.bot.send_message(
-                chat_id,
-                f"⚠️ No items found for {session.location}"
-            )
-            self._delete_session(user_id)
-            return
-        
-        # Initialize answers dict
-        for item in session.items:
-            session.answers[item['name']] = None
-        
-        # Start item entry
-        mode_text = "On-Hand Count" if mode == "on_hand" else "Delivery"
-        date = datetime.now().strftime('%Y-%m-%d')
-        
-        self.bot.send_message(
-            chat_id,
-            f"📝 <b>{session.location} • {mode_text}</b>\n"
-            f"📅 Date: {date}\n"
-            f"📦 Items: {len(session.items)}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Enter quantity for each item.\n"
-            f"You can use: back, skip, done, cancel"
-        )
-        
-        self._show_current_item(session)
     
     def _show_current_item(self, session: EntrySession):
         """Display current item with navigation buttons."""
@@ -4501,7 +4658,8 @@ class EnhancedEntryHandler:
             f"📋 <b>Review Your Entry</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Type: <b>{mode_text}</b>\n"
-            f"Location: <b>{session.location}</b>\n"
+            f"Location: <b>{session.vendor}</b>\n"
+            f"Submitter: <b>{session.submitter_name}</b>\n"
             f"Date: <b>{date}</b>\n\n"
         )
         
@@ -4547,11 +4705,18 @@ class EnhancedEntryHandler:
         self.bot.send_message(chat_id, text, reply_markup=keyboard)
     
     def _handle_submit(self, chat_id: int, user_id: int):
-        """Submit the entry to Notion with optional image."""
+        """
+        Submit entry to Notion and post review to prep chat with idempotency.
+        
+        Logs: submission, hash computation, duplicate check, Notion save, chat resolution, post.
+        """
         session = self.sessions.get(user_id)
         if not session:
+            self.logger.warning(f"No session for submit | user={user_id}")
             self.bot.send_message(chat_id, "No active session.")
             return
+        
+        self.logger.info(f"Entry submit action | vendor={session.vendor} mode={session.mode} user={user_id}")
         
         # Prepare data for saving
         quantities = {
@@ -4560,57 +4725,119 @@ class EnhancedEntryHandler:
         }
         
         date = datetime.now().strftime('%Y-%m-%d')
+        submitter = session.submitter_name if session.submitter_name else "Unknown"
         
-        # Save to Notion with image file ID (not processed data)
-        try:
-            success = self.notion.save_inventory_transaction(
-                location=session.location,
-                entry_type=session.mode,
-                date=date,
-                manager=session.manager_name,
-                notes=session.notes,
-                quantities=quantities,
-                image_file_id=session.image_file_id  # Pass the Telegram file ID
-            )
-            
-            if success:
-                # Success message
-                mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
-                items_count = session.get_answered_count()
-                total_qty = session.get_total_quantity()
-                image_note = " with image" if session.image_file_id else ""
-                
-                self.bot.send_message(
-                    chat_id,
-                    f"✅ <b>Entry Saved Successfully</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Location: {session.location}\n"
-                    f"Type: {mode_text}\n"
-                    f"Date: {date}\n"
-                    f"Items: {items_count}\n"
-                    f"Total: {total_qty:.1f} units{image_note}\n\n"
-                    f"Use /info to see updated status"
-                )
-                
-                # Log for audit
-                self.logger.info(
-                    f"Entry submitted: {session.location} {mode_text} "
-                    f"by user {user_id}, {items_count} items, total {total_qty:.1f}{image_note}"
-                )
-            else:
-                self.bot.send_message(
-                    chat_id,
-                    "⚠️ Failed to save to Notion. Please try again."
-                )
-                return
-                
-        except Exception as e:
-            self.logger.error(f"Error submitting entry: {e}", exc_info=True)
+        # Compute idempotency hash
+        entry_hash = self._compute_entry_hash(
+            vendor=session.vendor,
+            entry_type=session.mode,
+            date=date,
+            quantities=quantities,
+            submitter=submitter
+        )
+        
+        # Check for duplicate
+        if entry_hash in self.posted_entry_hashes:
+            posted_time = self.posted_entry_hashes[entry_hash]
+            self.logger.warning(f"Duplicate entry review blocked | hash={entry_hash[:16]}... posted_at={posted_time}")
             self.bot.send_message(
                 chat_id,
-                "⚠️ Error saving entry. Please contact support."
+                "⚠️ <b>Duplicate Entry Detected</b>\n"
+                "────────────────────────────\n"
+                "This exact entry has already been posted.\n"
+                "No duplicate created."
             )
+            self._delete_session(user_id)
             return
+        
+        # Save to Notion
+        try:
+            success = self.notion.save_inventory_transaction(
+                location=session.vendor,
+                entry_type=session.mode,
+                date=date,
+                manager=submitter,
+                notes=session.notes if hasattr(session, 'notes') else "",
+                quantities=quantities,
+                image_file_id=session.image_file_id if hasattr(session, 'image_file_id') else None
+            )
+            
+            if not success:
+                self.logger.error(f"Failed to save entry to Notion | vendor={session.vendor}")
+                self.bot.send_message(chat_id, "⚠️ Failed to save to Notion. Please try again.")
+                return
+            
+            self.logger.info(f"Entry saved to Notion | vendor={session.vendor} items={len([q for q in quantities.values() if q > 0])}")
+            
+        except Exception as e:
+            self.logger.error(f"Exception saving entry to Notion | error={e}", exc_info=True)
+            self.bot.send_message(chat_id, "⚠️ Error saving entry. Please contact support.")
+            return
+        
+        # Build review message for prep chat
+        review_message = self._build_entry_review_message(session, date, submitter)
+        
+        # Resolve prep chat
+        prep_chat_id = self.bot._resolve_order_prep_chat(session.vendor, f"entry_{user_id}")
+        
+        if not prep_chat_id:
+            self.logger.warning(f"No prep chat configured for entry | vendor={session.vendor}")
+            # Still show success to user since Notion save worked
+            self.bot.send_message(
+                chat_id,
+                f"✅ <b>Entry Saved</b>\n"
+                f"────────────────────────────\n"
+                f"Saved to Notion for {session.vendor}\n"
+                f"Items: {len([q for q in quantities.values() if q > 0])}\n\n"
+                f"⚠️ Note: No prep chat configured for notifications"
+            )
+            self._delete_session(user_id)
+            return
+        
+        # Post to prep chat
+        try:
+            self.logger.info(f"Posting entry review to prep chat | chat_id={prep_chat_id} vendor={session.vendor}")
+            post_success = self.bot.send_message(prep_chat_id, review_message)
+            
+            if post_success:
+                # Record hash to prevent duplicates
+                self.posted_entry_hashes[entry_hash] = datetime.now()
+                self.logger.info(f"Entry review posted successfully | hash={entry_hash[:16]}... chat={prep_chat_id}")
+                
+                # Success message to user
+                mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
+                items_count = len([q for q in quantities.values() if q > 0])
+                
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ <b>Entry Saved & Posted</b>\n"
+                    f"────────────────────────────\n"
+                    f"Saved {items_count} items for {session.vendor}\n"
+                    f"Type: {mode_text}\n"
+                    f"Date: {date}\n\n"
+                    f"Review posted to prep team"
+                )
+            else:
+                self.logger.error(f"Failed to post entry review | chat={prep_chat_id}")
+                # Still saved to Notion
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ <b>Entry Saved</b>\n"
+                    f"────────────────────────────\n"
+                    f"Saved to Notion successfully\n\n"
+                    f"⚠️ Failed to post notification"
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Exception posting entry review | error={e}", exc_info=True)
+            # Still saved to Notion
+            self.bot.send_message(
+                chat_id,
+                f"✅ <b>Entry Saved</b>\n"
+                f"────────────────────────────\n"
+                f"Saved to Notion successfully\n\n"
+                f"⚠️ Error posting notification"
+            )
         
         # Clean up session
         self._delete_session(user_id)
@@ -4683,6 +4910,16 @@ class EnhancedEntryHandler:
         for user_id in expired_users:
             self._delete_session(user_id)
         
+        # Clean up old entry hashes (older than 24 hours)
+        from datetime import timedelta
+        cutoff_time = datetime.now() - timedelta(hours=24)
+        old_hashes = [h for h, t in self.posted_entry_hashes.items() if t < cutoff_time]
+        for h in old_hashes:
+            del self.posted_entry_hashes[h]
+        
+        if old_hashes:
+            self.logger.debug(f"Cleaned up {len(old_hashes)} old entry hashes")
+        
         if expired_users:
             self.logger.info(f"Cleaned up {len(expired_users)} expired entry sessions")
 
@@ -4746,7 +4983,1478 @@ class EnhancedEntryHandler:
             reply_markup=keyboard
         )
 
+# ===== ORDER FLOW HANDLER =====
 
+class OrderFlowHandler:
+    """
+    Manages interactive /order flow: vendor selection, line-by-line item prompting,
+    Back/Skip/Cancel/Done navigation, Review, and final Confirm post.
+    """
+    
+    def __init__(self, bot, notion_manager, calculator):
+        """Initialize with dependencies."""
+        self.bot = bot
+        self.notion = notion_manager
+        self.calc = calculator
+        self.logger = logging.getLogger('business')
+        self.sessions: Dict[int, OrderSession] = {}
+    
+    def _get_kitchen_timezone(self) -> str:
+        """
+        Get kitchen timezone for date/time calculations.
+        
+        Returns:
+            str: Timezone string (e.g., 'America/Chicago')
+            
+        Logs: timezone retrieved
+        """
+        tz = BUSINESS_TIMEZONE  # From module constants
+        self.logger.debug(f"Kitchen timezone | tz={tz}")
+        return tz
+    
+    def _build_calendar_keyboard(self, session: OrderSession, target_date: datetime) -> Dict:
+        """
+        Build inline calendar keyboard for date selection.
+        
+        Creates a month grid with:
+        - Month/Year header
+        - Weekday labels
+        - Date buttons (disabled for past dates)
+        - Prev/Next month navigation
+        - "Type date instead" fallback
+        
+        Args:
+            session: Order session
+            target_date: Base date for calendar (usually today + month_offset)
+            
+        Returns:
+            Dict: Telegram inline keyboard markup
+            
+        Logs: calendar build, month offset, date range
+        """
+        import calendar
+        from datetime import datetime, timedelta
+        
+        self.logger.info(f"[{session.session_token}] Building calendar | month_offset={session._calendar_month_offset} target={target_date.strftime('%Y-%m')}")
+        
+        # Get month boundaries
+        year = target_date.year
+        month = target_date.month
+        
+        # Month name and year header
+        month_name = calendar.month_name[month]
+        header_text = f"📅 {month_name} {year}"
+        
+        # Build calendar grid
+        cal = calendar.monthcalendar(year, month)
+        today = datetime.now().date()
+        
+        buttons = []
+        
+        # Header row
+        buttons.append([{"text": header_text, "callback_data": "order_cal_noop"}])
+        
+        # Weekday labels
+        weekday_row = []
+        for day_name in ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su']:
+            weekday_row.append({"text": day_name, "callback_data": "order_cal_noop"})
+        buttons.append(weekday_row)
+        
+        # Date buttons
+        for week in cal:
+            week_row = []
+            for day in week:
+                if day == 0:
+                    # Empty cell
+                    week_row.append({"text": " ", "callback_data": "order_cal_noop"})
+                else:
+                    date_obj = datetime(year, month, day).date()
+                    date_str = date_obj.strftime('%Y-%m-%d')
+                    
+                    # Disable past dates
+                    if date_obj < today:
+                        week_row.append({"text": f"·{day}·", "callback_data": "order_cal_noop"})
+                    else:
+                        # Determine callback based on current mode
+                        if session.delivery_date is None:
+                            callback = f"order_delivery_date|{date_str}"
+                        else:
+                            callback = f"order_next_delivery_date|{date_str}"
+                        
+                        week_row.append({"text": str(day), "callback_data": callback})
+            
+            buttons.append(week_row)
+        
+        # Navigation row
+        nav_row = []
+        if session._calendar_month_offset > 0:
+            nav_row.append({"text": "◀️ Prev", "callback_data": "order_cal_prev"})
+        else:
+            nav_row.append({"text": " ", "callback_data": "order_cal_noop"})
+        
+        nav_row.append({"text": "✍️ Type date", "callback_data": "order_type_date"})
+        nav_row.append({"text": "Next ▶️", "callback_data": "order_cal_next"})
+        buttons.append(nav_row)
+        
+        # Cancel button
+        buttons.append([{"text": "❌ Cancel", "callback_data": "order_cancel"}])
+        
+        self.logger.debug(f"[{session.session_token}] Calendar built | year={year} month={month} weeks={len(cal)}")
+        
+        return {"inline_keyboard": buttons}
+    
+    def _compute_consumption_days(self, session: OrderSession) -> int:
+        """
+        Compute consumption days based on delivery dates and on-hand timing.
+        
+        Formula:
+        - start = today (or tomorrow if on-hand is night)
+        - end = next_delivery_date - 1 day
+        - consumption_days = max(0, (end - start).days + 1)
+        
+        Args:
+            session: Order session with delivery_date, next_delivery_date, onhand_time_hint
+            
+        Returns:
+            int: Consumption days (0 if invalid)
+            
+        Logs: timezone, start/end dates, on-hand timing, computed days
+        """
+        from datetime import datetime, timedelta
+        
+        self.logger.info(f"[{session.session_token}] Computing consumption days | delivery={session.delivery_date} next_delivery={session.next_delivery_date} onhand_time={session.onhand_time_hint}")
+        
+        if not session.delivery_date or not session.next_delivery_date:
+            self.logger.warning(f"[{session.session_token}] Missing delivery dates | cannot compute consumption days")
+            return 0
+        
+        # Get kitchen timezone
+        tz_str = self._get_kitchen_timezone()
+        
+        try:
+            # Parse dates
+            delivery = datetime.strptime(session.delivery_date, '%Y-%m-%d').date()
+            next_delivery = datetime.strptime(session.next_delivery_date, '%Y-%m-%d').date()
+            
+            # Get today in kitchen timezone
+            now_kitchen = get_time_in_timezone(tz_str)
+            today = now_kitchen.date()
+            
+            self.logger.debug(f"[{session.session_token}] Date parsing | today={today} delivery={delivery} next_delivery={next_delivery} tz={tz_str}")
+            
+            # Determine start date based on on-hand timing
+            if session.onhand_time_hint == "night":
+                start = today + timedelta(days=1)
+                self.logger.info(f"[{session.session_token}] On-hand recorded at night | start=tomorrow ({start})")
+            else:
+                # Default to morning (include today)
+                start = today
+                self.logger.info(f"[{session.session_token}] On-hand recorded in morning | start=today ({start})")
+            
+            # End is day before next delivery
+            end = next_delivery - timedelta(days=1)
+            
+            # Calculate consumption days
+            consumption_days = max(0, (end - start).days + 1)
+            
+            self.logger.info(f"[{session.session_token}] Consumption days computed | start={start} end={end} days={consumption_days}")
+            
+            return consumption_days
+            
+        except Exception as e:
+            self.logger.error(f"[{session.session_token}] Error computing consumption days | error={e}", exc_info=True)
+            return 0
+    
+    def _show_calendar_picker(self, session: OrderSession, mode: str):
+        """
+        Display calendar picker for date selection.
+        
+        Args:
+            session: Order session
+            mode: 'delivery' or 'next_delivery'
+            
+        Logs: calendar display, mode, month offset
+        """
+        from datetime import datetime
+        from dateutil.relativedelta import relativedelta
+        
+        self.logger.info(f"[{session.session_token}] Showing calendar picker | mode={mode} month_offset={session._calendar_month_offset}")
+        
+        # Calculate target month
+        today = datetime.now()
+        target_date = today + relativedelta(months=session._calendar_month_offset)
+        
+        # Build keyboard
+        keyboard = self._build_calendar_keyboard(session, target_date)
+        
+        # Build prompt text
+        if mode == "delivery":
+            text = (
+                f"📋 <b>{session.vendor} Order</b>\n"
+                f"───────────────────────────────\n\n"
+                f"📅 <b>Select Delivery Date</b>\n\n"
+                f"Choose the date when this order will be delivered.\n"
+                f"Or use the 'Type date' button to enter manually."
+            )
+        else:  # next_delivery
+            text = (
+                f"📋 <b>{session.vendor} Order</b>\n"
+                f"───────────────────────────────\n"
+                f"Delivery: <b>{session.delivery_date}</b>\n\n"
+                f"📅 <b>Select Next Delivery Date</b>\n\n"
+                f"Choose the next expected delivery after this one.\n"
+                f"This determines how many days the order must cover."
+            )
+        
+        self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
+        self.logger.debug(f"[{session.session_token}] Calendar picker sent | mode={mode}")
+    
+    def _show_onhand_timing_prompt(self, session: OrderSession):
+        """
+        Prompt user for on-hand timing (morning or night).
+        
+        First looks up most recent On-Hand entry in Notion to show as hint.
+        
+        This determines whether to include today in consumption days calculation.
+        
+        Logs: on-hand timing prompt, Notion metadata lookup, hint display
+        """
+        from datetime import datetime
+        
+        self.logger.info(f"[{session.session_token}] Showing on-hand timing prompt | vendor={session.vendor}")
+        
+        # Try to get latest on-hand metadata from Notion
+        metadata = None
+        try:
+            metadata = self.notion.get_latest_onhand_metadata(session.vendor)
+            self.logger.info(f"[{session.session_token}] On-hand metadata retrieved | found={metadata is not None}")
+        except Exception as e:
+            self.logger.warning(f"[{session.session_token}] Failed to get on-hand metadata | error={e}")
+            metadata = None
+        
+        # Build prompt text
+        text = (
+            f"📋 <b>{session.vendor} Order</b>\n"
+            f"───────────────────────────────\n"
+            f"Delivery: <b>{session.delivery_date}</b>\n"
+            f"Next delivery: <b>{session.next_delivery_date}</b>\n\n"
+            f"⏰ <b>On-Hand Timing</b>\n\n"
+        )
+        
+        # Add hint if metadata available
+        if metadata:
+            created_time = metadata.get('created_time', '')
+            created_by = metadata.get('created_by', 'Unknown')
+            multiple_recent = metadata.get('multiple_recent', False)
+            
+            # Format timestamp for display
+            try:
+                # Parse UTC timestamp from Notion
+                dt_utc = datetime.fromisoformat(created_time.replace('Z', '+00:00'))
+                
+                # Convert to kitchen timezone
+                try:
+                    import pytz
+                    kitchen_tz = pytz.timezone(BUSINESS_TIMEZONE)
+                    dt_local = dt_utc.astimezone(kitchen_tz)
+                    formatted_time = dt_local.strftime('%Y-%m-%d %H:%M')
+                    self.logger.debug(f"[{session.session_token}] Timestamp converted | utc={created_time} local={formatted_time}")
+                except ImportError:
+                    # Fallback if pytz not available - use system local time
+                    dt_local = dt_utc.astimezone()
+                    formatted_time = dt_local.strftime('%Y-%m-%d %H:%M')
+                    self.logger.debug(f"[{session.session_token}] Timestamp converted (system tz) | utc={created_time} local={formatted_time}")
+            except:
+                formatted_time = created_time[:16] if created_time else 'Unknown'
+                self.logger.warning(f"[{session.session_token}] Failed to parse timestamp | using raw={formatted_time}")
+            
+            text += (
+                f"💡 <b>Last on-hand in Notion:</b>\n"
+                f"   {formatted_time} by {created_by}\n"
+            )
+            
+            if multiple_recent:
+                text += f"   ⚠️ <i>Multiple recent entries found—please confirm.</i>\n"
+            
+            text += f"\n"
+            
+            self.logger.info(f"[{session.session_token}] Showing on-hand hint | time={formatted_time} by={created_by} multiple={multiple_recent}")
+        else:
+            self.logger.info(f"[{session.session_token}] No on-hand hint available | falling back to basic prompt")
+        
+        text += (
+            f"When was the on-hand inventory last recorded?\n\n"
+            f"🌅 <b>Morning</b> - Include today in consumption\n"
+            f"🌙 <b>Night</b> - Start consumption tomorrow\n\n"
+            f"This affects how many days the order must cover."
+        )
+        
+        keyboard = self._create_keyboard([
+            [("🌅 Morning", "order_onhand|morning"), ("🌙 Night", "order_onhand|night")],
+            [("❌ Cancel", "order_cancel")]
+        ])
+        
+        self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
+        self.logger.debug(f"[{session.session_token}] On-hand timing prompt sent | hint_shown={metadata is not None}")
+    
+    def _handle_delivery_date_callback(self, chat_id: int, user_id: int, date_str: str):
+        """
+        Handle delivery date selection from calendar.
+        
+        Validates date, stores it, then shows calendar for next delivery date.
+        
+        Args:
+            date_str: Date in YYYY-MM-DD format
+            
+        Logs: date selected, validation, next prompt
+        """
+        from datetime import datetime
+        
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for delivery date | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        self.logger.info(f"[{session.session_token}] Delivery date selected | date={date_str}")
+        
+        # Validate date format
+        try:
+            selected_date = datetime.strptime(date_str, "%Y-%m-%d")
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            if selected_date < today:
+                self.logger.warning(f"[{session.session_token}] Past delivery date rejected | date={date_str}")
+                self.bot.send_message(chat_id, "⚠️ Cannot select a past date. Please choose again.")
+                self._show_calendar_picker(session, "delivery")
+                return
+            
+            session.delivery_date = date_str
+            session.update_activity()
+            self.logger.info(f"[{session.session_token}] Delivery date stored | date={date_str}")
+            
+            # Reset calendar offset for next delivery
+            session._calendar_month_offset = 0
+            
+            # Show calendar for next delivery date
+            self._show_calendar_picker(session, "next_delivery")
+            
+        except ValueError as e:
+            self.logger.error(f"[{session.session_token}] Invalid delivery date format | date={date_str} error={e}")
+            self.bot.send_message(chat_id, "⚠️ Invalid date format. Please try again.")
+            self._show_calendar_picker(session, "delivery")
+    
+    def _handle_next_delivery_date_callback(self, chat_id: int, user_id: int, date_str: str):
+        """
+        Handle next delivery date selection from calendar.
+        
+        Validates next_delivery > delivery, stores it, then prompts for on-hand timing.
+        
+        Args:
+            date_str: Date in YYYY-MM-DD format
+            
+        Logs: date selected, validation, on-hand timing prompt
+        """
+        from datetime import datetime
+        
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for next delivery date | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        self.logger.info(f"[{session.session_token}] Next delivery date selected | date={date_str}")
+        
+        # Validate date format
+        try:
+            selected_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            delivery_date = datetime.strptime(session.delivery_date, "%Y-%m-%d").date()
+            
+            # Validate next_delivery > delivery
+            if selected_date <= delivery_date:
+                self.logger.warning(f"[{session.session_token}] Next delivery not after delivery | next={date_str} delivery={session.delivery_date}")
+                self.bot.send_message(
+                    chat_id,
+                    f"⚠️ <b>Invalid Date Range</b>\n"
+                    f"───────────────────────────────\n"
+                    f"Next delivery must be AFTER delivery date.\n\n"
+                    f"Delivery: {session.delivery_date}\n"
+                    f"Next delivery: {date_str} ❌\n\n"
+                    f"Please select a later date."
+                )
+                self._show_calendar_picker(session, "next_delivery")
+                return
+            
+            session.next_delivery_date = date_str
+            session.update_activity()
+            self.logger.info(f"[{session.session_token}] Next delivery date stored | date={date_str}")
+            
+            # Prompt for on-hand timing
+            self._show_onhand_timing_prompt(session)
+            
+        except ValueError as e:
+            self.logger.error(f"[{session.session_token}] Invalid next delivery date format | date={date_str} error={e}")
+            self.bot.send_message(chat_id, "⚠️ Invalid date format. Please try again.")
+            self._show_calendar_picker(session, "next_delivery")
+    
+    def _handle_onhand_timing_callback(self, chat_id: int, user_id: int, timing: str):
+        """
+        Handle on-hand timing selection.
+        
+        Stores timing, computes consumption days, then prompts for submitter name.
+        
+        Args:
+            timing: 'morning' or 'night'
+            
+        Logs: timing selected, consumption days computed, submitter prompt
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for on-hand timing | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        self.logger.info(f"[{session.session_token}] On-hand timing selected by user | timing={timing} vendor={session.vendor}")
+        
+        session.onhand_time_hint = timing
+        session.update_activity()
+        
+        # Log the user's final choice (not auto-decided)
+        self.logger.critical(f"[{session.session_token}] USER CHOICE CONFIRMED | on_hand_timing={timing} delivery={session.delivery_date} next={session.next_delivery_date}")
+        
+        # Compute consumption days
+        consumption_days = self._compute_consumption_days(session)
+        session.consumption_days = consumption_days
+        
+        if consumption_days == 0:
+            self.logger.warning(f"[{session.session_token}] Zero consumption days computed | allowing continue with warning")
+            self.bot.send_message(
+                chat_id,
+                f"⚠️ <b>Warning</b>\n"
+                f"Consumption days computed as 0.\n"
+                f"This may indicate an invalid date range.\n\n"
+                f"Continuing anyway..."
+            )
+        
+        self.logger.info(f"[{session.session_token}] Consumption days set | days={consumption_days}")
+        
+        # Show submitter prompt
+        self._show_submitter_prompt_order(session)
+    
+    def _handle_type_date_callback(self, chat_id: int, user_id: int):
+        """
+        Handle "Type date instead" button from calendar picker.
+        
+        Switches to text input mode for custom date entry.
+        
+        Logs: type date requested, input mode set
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for type date | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        # Determine which date we're entering
+        if session.delivery_date is None:
+            mode = "delivery"
+            prompt = "delivery date"
+        else:
+            mode = "next_delivery"
+            prompt = "next delivery date"
+        
+        self.logger.info(f"[{session.session_token}] Type date mode activated | mode={mode}")
+        
+        session._date_input_mode = mode
+        session.update_activity()
+        
+        self.bot.send_message(
+            chat_id,
+            f"📅 <b>Enter {prompt.title()}</b>\n"
+            f"───────────────────────────────\n"
+            f"Format: YYYY-MM-DD\n"
+            f"Example: 2025-10-15\n\n"
+            f"Or type /cancel to go back"
+        )
+    
+    def _format_date_range_label(self, start_date: str, end_date: str) -> str:
+        """
+        Format date range as human-readable label (e.g., 'Sat–Wed').
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            
+        Returns:
+            str: Formatted range label
+            
+        Logs: date parsing, label generation
+        """
+        from datetime import datetime
+        
+        try:
+            start = datetime.strptime(start_date, '%Y-%m-%d')
+            end = datetime.strptime(end_date, '%Y-%m-%d')
+            
+            # Get abbreviated day names
+            start_day = start.strftime('%a')  # e.g., 'Sat'
+            end_day = end.strftime('%a')  # e.g., 'Wed'
+            
+            range_label = f"{start_day}–{end_day}"
+            
+            self.logger.debug(f"Date range label | start={start_date} end={end_date} label='{range_label}'")
+            
+            return range_label
+            
+        except Exception as e:
+            self.logger.error(f"Error formatting date range | start={start_date} end={end_date} error={e}")
+            return "Date Range"
+    
+    def _compute_item_recommendation(self, adu: float, consumption_days: int, on_hand: float) -> int:
+        """
+        Compute recommended order quantity.
+        
+        Formula: max(0, round(ADU * ConsumptionDays - OnHand))
+        
+        Args:
+            adu: Average daily usage
+            consumption_days: Days to cover
+            on_hand: Current on-hand quantity
+            
+        Returns:
+            int: Recommended order quantity (whole number)
+            
+        Logs: all inputs and computed recommendation
+        """
+        import math
+        
+        need = adu * consumption_days
+        recommended_raw = need - on_hand
+        recommended = max(0, math.ceil(recommended_raw))
+        
+        self.logger.debug(f"Item recommendation | adu={adu} days={consumption_days} on_hand={on_hand} need={need:.2f} rec={recommended}")
+        
+        return recommended
+    
+    def _handle_use_recommended(self, chat_id: int, user_id: int, item_name: str, rec_qty: str):
+        """
+        Handle "Use recommended" button click.
+        
+        Pre-fills the recommended quantity and advances to next item.
+        
+        Args:
+            item_name: Name of item
+            rec_qty: Recommended quantity as string
+            
+        Logs: action, item, quantity set
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for use recommended | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        try:
+            qty = float(rec_qty)
+            
+            self.logger.info(f"[{session.session_token}] Use recommended action | item={item_name} qty={qty}")
+            
+            # Verify current item matches
+            current_item = session.get_current_item()
+            if not current_item or current_item['name'] != item_name:
+                self.logger.warning(f"[{session.session_token}] Item mismatch | expected={current_item['name'] if current_item else 'none'} got={item_name}")
+                self.bot.send_message(chat_id, "⚠️ Item mismatch. Please try again.")
+                self._show_current_item(session)
+                return
+            
+            # Set quantity and advance
+            session.set_current_quantity(qty)
+            session.index += 1
+            
+            self.logger.info(f"[{session.session_token}] Recommended quantity set | item={item_name} qty={qty}")
+            
+            # Show next item or done
+            if session.index >= len(session.items):
+                self._handle_done(chat_id, session.user_id)
+            else:
+                self._show_current_item(session)
+                
+        except ValueError as e:
+            self.logger.error(f"[{session.session_token}] Invalid recommended quantity | rec_qty='{rec_qty}' error={e}")
+            self.bot.send_message(chat_id, "⚠️ Error using recommended quantity. Please try again.")
+            self._show_current_item(session)
+
+    def handle_preselected_vendor_command(self, message: Dict, vendor: str):
+        """
+        Entry point for vendor-specific commands (/order_avondale, /order_commissary).
+        Delegates to interactive flow with vendor preselected.
+        
+        Logs: command entry, vendor, session check, delegation.
+        """
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        session_token = str(uuid.uuid4())[:8]
+        
+        self.logger.info(f"[{session_token}] Vendor-specific order command | vendor={vendor} user={user_id} chat={chat_id}")
+        
+        # Check for active session
+        if user_id in self.sessions:
+            session = self.sessions[user_id]
+            if not session.is_expired():
+                # If existing session is for same vendor, offer resume
+                if session.vendor == vendor:
+                    self.logger.info(f"[{session.session_token}] Active session for same vendor | vendor={vendor} progress={session.get_progress()}")
+                    keyboard = self._create_keyboard([
+                        [("📂 Resume", "order_resume"), ("🔄 Start Over", "order_restart")],
+                        [("❌ Cancel", "order_cancel_existing")]
+                    ])
+                    self.bot.send_message(
+                        chat_id,
+                        f"📋 <b>Active {vendor} Order Session</b>\n"
+                        f"────────────────────────────\n"
+                        f"Progress: {session.get_progress()} • Entered: {session.get_entered_count()}\n\n"
+                        f"What would you like to do?",
+                        reply_markup=keyboard
+                    )
+                    return
+                else:
+                    # Different vendor - inform and offer to cancel old session
+                    self.logger.info(f"[{session.session_token}] Active session for different vendor | existing={session.vendor} requested={vendor}")
+                    keyboard = self._create_keyboard([
+                        [("🔄 Switch to " + vendor, "order_restart")],
+                        [("❌ Cancel", "order_cancel_existing")]
+                    ])
+                    self.bot.send_message(
+                        chat_id,
+                        f"⚠️ <b>Active Session for {session.vendor}</b>\n"
+                        f"────────────────────────────\n"
+                        f"You have an active order for {session.vendor}.\n"
+                        f"Progress: {session.get_progress()}\n\n"
+                        f"Cancel it to start {vendor} order?",
+                        reply_markup=keyboard
+                    )
+                    return
+        
+        # No active session - start directly with vendor
+        self.logger.info(f"[{session_token}] No active session | starting directly with vendor={vendor}")
+        self._handle_vendor_selection(chat_id, user_id, vendor)
+    
+    def handle_order_command(self, message: Dict):
+        """
+        Entry point for /order command.
+        Check for existing session; if present, offer resume/restart.
+        Otherwise start vendor selection.
+        
+        Logs: command entry, session check, vendor prompt.
+        """
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        session_token = str(uuid.uuid4())[:8]
+        
+        self.logger.info(f"[{session_token}] /order command entry | user={user_id} chat={chat_id}")
+        
+        # Check for active session
+        if user_id in self.sessions:
+            session = self.sessions[user_id]
+            if not session.is_expired():
+                self.logger.info(f"[{session.session_token}] Active session found | vendor={session.vendor} progress={session.get_progress()}")
+                # Offer resume or restart
+                keyboard = self._create_keyboard([
+                    [("📂 Resume", "order_resume"), ("🔄 Start Over", "order_restart")],
+                    [("❌ Cancel", "order_cancel_existing")]
+                ])
+                self.bot.send_message(
+                    chat_id,
+                    f"📋 <b>Active Order Session</b>\n"
+                    f"────────────────────────────\n"
+                    f"Vendor: {session.vendor}\n"
+                    f"Progress: {session.get_progress()} • Entered: {session.get_entered_count()}\n\n"
+                    f"What would you like to do?",
+                    reply_markup=keyboard
+                )
+                return
+        
+        # No active session - start new
+        self.logger.info(f"[{session_token}] No active session | starting vendor selection")
+        self._start_vendor_selection(chat_id, user_id, session_token)
+    
+    def _start_vendor_selection(self, chat_id: int, user_id: int, session_token: str):
+        """
+        Prompt user to select vendor (Avondale or Commissary).
+        
+        Logs: vendor selection prompt.
+        """
+        self.logger.info(f"[{session_token}] Prompting vendor selection")
+        keyboard = self._create_keyboard([
+            [("🏪 Avondale", "order_vendor|Avondale")],
+            [("🏭 Commissary", "order_vendor|Commissary")],
+            [("❌ Cancel", "order_cancel")]
+        ])
+        self.bot.send_message(
+            chat_id,
+            "📋 <b>Interactive Order Flow</b>\n"
+            "────────────────────────────\n"
+            "Select vendor:",
+            reply_markup=keyboard
+        )
+    
+    def handle_callback(self, callback_query: Dict):
+        """
+        Route all order-related callbacks.
+        
+        Logs: callback data, routing decision.
+        """
+        data = callback_query.get("data", "")
+        message = callback_query.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        user_id = callback_query.get("from", {}).get("id")
+        
+        # Acknowledge callback
+        self.bot._make_request("answerCallbackQuery", {"callback_query_id": callback_query.get("id")})
+        
+        session = self.sessions.get(user_id)
+        token = session.session_token if session else "no_session"
+        self.logger.info(f"[{token}] Order callback | data={data} user={user_id}")
+        
+        # Route vendor selection
+        if data.startswith("order_vendor|"):
+            vendor = data.split("|")[1]
+            self._handle_vendor_selection(chat_id, user_id, vendor)
+        
+        # Route delivery date selection
+        elif data.startswith("order_delivery_date|"):
+            date_str = data.split("|", 1)[1]
+            self._handle_delivery_date_callback(chat_id, user_id, date_str)
+        
+        # Route next delivery date selection
+        elif data.startswith("order_next_delivery_date|"):
+            date_str = data.split("|", 1)[1]
+            self._handle_next_delivery_date_callback(chat_id, user_id, date_str)
+        
+        # Route on-hand timing selection
+        elif data.startswith("order_onhand|"):
+            timing = data.split("|")[1]
+            self._handle_onhand_timing_callback(chat_id, user_id, timing)
+        
+        # Calendar navigation
+        elif data == "order_cal_prev":
+            if session:
+                session._calendar_month_offset -= 1
+                mode = "delivery" if session.delivery_date is None else "next_delivery"
+                self._show_calendar_picker(session, mode)
+        
+        elif data == "order_cal_next":
+            if session:
+                session._calendar_month_offset += 1
+                mode = "delivery" if session.delivery_date is None else "next_delivery"
+                self._show_calendar_picker(session, mode)
+        
+        elif data == "order_type_date":
+            self._handle_type_date_callback(chat_id, user_id)
+        
+        elif data == "order_cal_noop":
+            pass  # Ignore spacer/header buttons
+        
+        # Route use recommended action
+        elif data.startswith("order_use_rec|"):
+            parts = data.split("|")
+            if len(parts) >= 3:
+                item_name = parts[1]
+                rec_qty = parts[2]
+                self._handle_use_recommended(chat_id, user_id, item_name, rec_qty)
+        
+        # Existing navigation callbacks
+        elif data == "order_back":
+            self._handle_back(chat_id, user_id)
+        elif data == "order_skip":
+            self._handle_skip(chat_id, user_id)
+        elif data == "order_done":
+            self._handle_done(chat_id, user_id)
+        elif data in ["order_cancel", "order_cancel_existing"]:
+            self._handle_cancel(chat_id, user_id)
+        elif data == "order_resume":
+            self._resume_session(chat_id, user_id)
+        elif data == "order_restart":
+            self._delete_session(user_id)
+            session_token = str(uuid.uuid4())[:8]
+            self._start_vendor_selection(chat_id, user_id, session_token)
+        elif data == "order_confirm":
+            self._handle_confirm(chat_id, user_id)
+        elif data == "order_review_back":
+            self._resume_items(chat_id, user_id)
+    
+    def _handle_vendor_selection(self, chat_id: int, user_id: int, vendor: str):
+        """
+        Handle vendor selection, create session, then show calendar picker for delivery date.
+        
+        Logs: vendor selected, session creation, calendar prompt.
+        """
+        session_token = str(uuid.uuid4())[:8]
+        self.logger.info(f"[{session_token}] Vendor selected | vendor={vendor} user={user_id}")
+        
+        # Create session with vendor
+        session = OrderSession(
+            user_id=user_id,
+            chat_id=chat_id,
+            session_token=session_token,
+            vendor=vendor,
+            items=[],
+            _calendar_month_offset=0
+        )
+        
+        self.sessions[user_id] = session
+        self.logger.info(f"[{session_token}] Session created | vendor={vendor}")
+        
+        # Show calendar picker for delivery date
+        self._show_calendar_picker(session, "delivery")
+
+    def _load_items_and_begin_entry(self, session: OrderSession):
+        """
+        Load catalog items and begin item entry loop.
+        Previously this was part of _handle_vendor_selection.
+        
+        Logs: catalog load, item count, first item display.
+        """
+        # Load items for vendor
+        try:
+            items_objs = self.notion.get_items_for_location(session.vendor, use_cache=False)
+            self.logger.info(f"[{session.session_token}] Loaded {len(items_objs)} items from Notion | vendor={session.vendor}")
+        except Exception as e:
+            self.logger.error(f"[{session.session_token}] Failed to load items | vendor={session.vendor} error={e}", exc_info=True)
+            self.bot.send_message(session.chat_id, "⚠️ Unable to load catalog items. Please try again.")
+            self._delete_session(session.user_id)
+            return
+        
+        if not items_objs:
+            self.logger.warning(f"[{session.session_token}] No items found | vendor={session.vendor}")
+            self.bot.send_message(session.chat_id, f"⚠️ No items found for {session.vendor}")
+            self._delete_session(session.user_id)
+            return
+        
+        # Get current inventory (On Hand)
+        try:
+            inventory_data = self.notion.get_latest_inventory(session.vendor, entry_type="on_hand")
+            self.logger.info(f"[{session.session_token}] Loaded inventory data | vendor={session.vendor} items_count={len(inventory_data)}")
+        except Exception as e:
+            self.logger.error(f"[{session.session_token}] Failed to load inventory | vendor={session.vendor} error={e}", exc_info=True)
+            inventory_data = {}
+        
+        # Build items list with On Hand and ADU
+        items = []
+        for item_obj in items_objs:
+            on_hand = inventory_data.get(item_obj.name, 0.0)
+            items.append({
+                'name': item_obj.name,
+                'unit': item_obj.unit_type,
+                'adu': item_obj.adu,
+                'on_hand': on_hand,
+                'id': item_obj.id
+            })
+            self.logger.debug(f"[{session.session_token}] Item prepared | name={item_obj.name} on_hand={on_hand} adu={item_obj.adu}")
+        
+        session.items = items
+        
+        # Initialize quantities dict
+        for item in items:
+            session.quantities[item['name']] = None
+        
+        # Reset index to start item entry
+        session.index = 0
+        
+        self.logger.info(f"[{session.session_token}] Items loaded | count={len(items)}")
+        
+        # Show welcome and first item
+        self.bot.send_message(
+            session.chat_id,
+            f"📋 <b>{session.vendor} Order</b>\n"
+            f"────────────────────────────\n"
+            f"Date: {session.order_date}\n"
+            f"Submitter: {session.submitter_name}\n"
+            f"Items: {len(items)}\n\n"
+            f"Enter order quantity for each item.\n"
+            f"On Hand and ADU are shown for context.\n\n"
+            f"Use: Back, Skip, Done, Cancel"
+        )
+        self._show_current_item(session)
+    
+    def _show_submitter_prompt_order(self, session: OrderSession):
+        """
+        Prompt user to enter their name for order.
+        
+        Logs: submitter prompt
+        """
+        self.logger.info(f"[{session.session_token}] Showing submitter prompt for order")
+        
+        # Set special index to indicate submitter input mode
+        session.index = -2  # Different from -1 (custom date mode)
+        
+        self.bot.send_message(
+            session.chat_id,
+            f"📋 <b>{session.vendor} Order</b>\n"
+            f"────────────────────────────\n\n"
+            f"👤 <b>Enter Your Name</b>\n\n"
+            f"Type your name to continue.\n"
+            f"Or type /cancel to exit."
+        )
+
+    def _show_current_item(self, session: OrderSession):
+        """
+        Display current item with On Hand, ADU, Consumption Days, Recommended, and navigation buttons.
+        
+        Logs: item displayed, current value if already entered, consumption days, recommendation.
+        """
+        from datetime import datetime, timedelta
+        
+        item = session.get_current_item()
+        if not item:
+            self.logger.info(f"[{session.session_token}] No current item | moving to done")
+            self._handle_done(session.chat_id, session.user_id)
+            return
+        
+        progress = session.get_progress()
+        current_value = session.quantities.get(item['name'])
+        
+        self.logger.info(f"[{session.session_token}] Displaying item | name={item['name']} progress={progress} current_value={current_value}")
+        
+        # Compute consumption days and recommended
+        consumption_days = session.consumption_days if session.consumption_days else 0
+        
+        # Compute date range label
+        if session.delivery_date and session.next_delivery_date:
+            # Get kitchen timezone
+            tz_str = self._get_kitchen_timezone()
+            now_kitchen = get_time_in_timezone(tz_str)
+            today = now_kitchen.date()
+            
+            # Determine start date based on on-hand timing
+            if session.onhand_time_hint == "night":
+                start = today + timedelta(days=1)
+            else:
+                start = today
+            
+            # End is day before next delivery
+            next_delivery = datetime.strptime(session.next_delivery_date, '%Y-%m-%d').date()
+            end = next_delivery - timedelta(days=1)
+            
+            range_label = self._format_date_range_label(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
+        else:
+            range_label = "Not Set"
+        
+        # Compute recommended quantity
+        recommended = self._compute_item_recommendation(item['adu'], consumption_days, item['on_hand'])
+        
+        self.logger.info(f"[{session.session_token}] Item computed | name={item['name']} days={consumption_days} range='{range_label}' rec={recommended}")
+        
+        # Build message text
+        text = (
+            f"[{progress}] <b>{item['name']}</b>\n"
+            f"Unit: {item['unit']}\n"
+            f"ADU: {item['adu']:.2f} /day\n"
+            f"On-Hand: {item['on_hand']:.1f}\n"
+            f"Consumption Days: {consumption_days} ({range_label})\n"
+            f"Recommended: {recommended}\n"
+            f"\n"
+            f"Enter order quantity:"
+        )
+        
+        if current_value is not None:
+            text += f"\n💡 Current order: {current_value}"
+        
+        # Create navigation buttons
+        buttons = []
+        
+        # First row: Back (if not first) and Skip
+        first_row = []
+        if session.index > 0:
+            first_row.append(("◀️ Back", "order_back"))
+        first_row.append(("⏭️ Skip", "order_skip"))
+        buttons.append(first_row)
+        
+        # Second row: Use recommended button
+        if recommended > 0:
+            buttons.append([("✅ Use recommended " + str(recommended), f"order_use_rec|{item['name']}|{recommended}")])
+        
+        # Third row: Done and Cancel
+        buttons.append([("✅ Done", "order_done"), ("❌ Cancel", "order_cancel")])
+        
+        keyboard = self._create_keyboard(buttons)
+        
+        # Log message details
+        self.logger.debug(f"[{session.session_token}] Item prompt sent | item={item['name']} text_len={len(text)} buttons={len(buttons)}")
+        
+        self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
+
+    def handle_text_input(self, message: Dict, session: OrderSession):
+        """
+        Validate and process text input for current item or person tag capture.
+        
+        States handled:
+        - Item quantity entry: validate numeric, reject negative
+        - Person tag capture (on Review screen): store any text
+        
+        Logs: input received, state, validation result, quantity/tag set.
+        """
+        text = message.get("text", "").strip()
+        chat_id = session.chat_id
+        
+        session.update_activity()
+        self.logger.info(f"[{session.session_token}] Text input | text='{text}' index={session.index}")
+
+        # Check for cancel command FIRST (works in all input modes)
+        if text.lower() in ["/cancel", "cancel"]:
+            self.logger.info(f"[{session.session_token}] Cancel requested during input")
+            self._handle_cancel(chat_id, session.user_id)
+            return
+        
+        # Check if we're in custom date input mode
+        if hasattr(session, '_date_input_mode') and session._date_input_mode:
+            from datetime import datetime
+            
+            mode = session._date_input_mode
+            self.logger.info(f"[{session.session_token}] Custom date input | mode={mode} text='{text}'")
+            
+            # Validate date format
+            try:
+                selected_date = datetime.strptime(text, "%Y-%m-%d")
+                today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                if selected_date < today:
+                    self.logger.warning(f"[{session.session_token}] Past date rejected | date={text}")
+                    self.bot.send_message(chat_id, "⚠️ Cannot select a past date. Please enter a valid date.")
+                    return
+                
+                # Store date based on mode
+                if mode == "delivery":
+                    session.delivery_date = text
+                    session._date_input_mode = None
+                    self.logger.info(f"[{session.session_token}] Custom delivery date stored | date={text}")
+                    
+                    # Show calendar for next delivery
+                    self._show_calendar_picker(session, "next_delivery")
+                
+                elif mode == "next_delivery":
+                    # Validate next_delivery > delivery
+                    delivery_date = datetime.strptime(session.delivery_date, "%Y-%m-%d").date()
+                    if selected_date.date() <= delivery_date:
+                        self.logger.warning(f"[{session.session_token}] Next delivery not after delivery | next={text} delivery={session.delivery_date}")
+                        self.bot.send_message(
+                            chat_id,
+                            f"⚠️ Next delivery must be AFTER delivery date.\n"
+                            f"Delivery: {session.delivery_date}\n"
+                            f"Next delivery: {text} ❌\n\n"
+                            f"Please enter a later date."
+                        )
+                        return
+                    
+                    session.next_delivery_date = text
+                    session._date_input_mode = None
+                    self.logger.info(f"[{session.session_token}] Custom next delivery date stored | date={text}")
+                    
+                    # Show on-hand timing prompt
+                    self._show_onhand_timing_prompt(session)
+                
+                return
+                
+            except ValueError:
+                self.logger.warning(f"[{session.session_token}] Invalid custom date format | text='{text}'")
+                self.bot.send_message(
+                    chat_id,
+                    "⚠️ Invalid date format. Please use YYYY-MM-DD\n"
+                    "Example: 2025-10-15\n\n"
+                    "Or type /cancel to go back"
+                )
+                return
+ 
+        # Check if we're in submitter name input mode (index = -2)
+        if session.index == -2:
+            text_clean = text.strip()
+            
+            if not text_clean:
+                self.logger.warning(f"[{session.session_token}] Empty submitter name rejected")
+                self.bot.send_message(chat_id, "⚠️ Name cannot be empty. Please enter your name.")
+                return
+            
+            session.submitter_name = text_clean
+            self.logger.info(f"[{session.session_token}] Submitter name captured | name='{session.submitter_name}'")
+            
+            # Now load items and begin entry
+            self._load_items_and_begin_entry(session)
+            return
+
+        # Check if we're on Review screen waiting for person tag
+        
+        # Check if we're on Review screen waiting for person tag
+        # (after Done was pressed, before Confirm)
+        # This is indicated by index >= len(items) but not yet confirmed
+        if session.index >= len(session.items):
+            # We're on Review screen - capture as person tag
+            self.logger.info(f"[{session.session_token}] Capturing person tag on Review | tag='{text}'")
+            session.person_tag = text
+            session.update_activity()
+            
+            # Re-display Review with updated tag
+            self._show_review_with_tag(session)
+            return
+        
+        # Otherwise we're in item entry mode
+        # Check for text commands
+        lower = text.lower()
+        if lower in ["/back", "back"]:
+            self._handle_back(chat_id, session.user_id)
+            return
+        elif lower in ["/skip", "skip"]:
+            self._handle_skip(chat_id, session.user_id)
+            return
+        elif lower in ["/done", "done"]:
+            self._handle_done(chat_id, session.user_id)
+            return
+        elif lower in ["/cancel", "cancel"]:
+            self._handle_cancel(chat_id, session.user_id)
+            return
+        
+        # Validate numeric input for item quantity
+        try:
+            qty = float(text)
+            if qty < 0:
+                raise ValueError("Negative quantity")
+            
+            item = session.get_current_item()
+            item_name = item['name'] if item else 'unknown'
+            self.logger.info(f"[{session.session_token}] Valid quantity | qty={qty} item={item_name}")
+            session.set_current_quantity(qty)
+            session.index += 1
+            
+            # Show next item or done
+            if session.index >= len(session.items):
+                self._handle_done(chat_id, session.user_id)
+            else:
+                self._show_current_item(session)
+        
+        except ValueError as e:
+            self.logger.warning(f"[{session.session_token}] Invalid quantity input | text='{text}' error={e}")
+            self.bot.send_message(
+                chat_id,
+                "❌ Please enter a valid number (0 or positive)\n"
+                "Or use: Back, Skip, Done, Cancel"
+            )
+            self._show_current_item(session)
+
+    def _handle_back(self, chat_id: int, user_id: int):
+        """
+        Navigate to previous item, restore prior prompt state.
+        
+        Logs: back action, new index.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for back | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        if session.index > 0:
+            session.move_back()
+            self.logger.info(f"[{session.session_token}] Back action | new_index={session.index}")
+            self._show_current_item(session)
+        else:
+            self.logger.info(f"[{session.session_token}] Back at first item | index=0")
+            self.bot.send_message(chat_id, "Already at first item.")
+            self._show_current_item(session)
+    
+    def _handle_skip(self, chat_id: int, user_id: int):
+        """
+        Skip current item (record None), advance index.
+        
+        Logs: skip action, item skipped.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for skip | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        item = session.get_current_item()
+        self.logger.info(f"[{session.session_token}] Skip action | item={item['name'] if item else 'none'}")
+        session.skip_current()
+        
+        if session.index >= len(session.items):
+            self._handle_done(chat_id, user_id)
+        else:
+            self._show_current_item(session)
+    
+    def _handle_done(self, chat_id: int, user_id: int):
+        """
+        Short-circuit to Review without losing prior entries.
+        Show minimal review: delivery date + qty × item lines.
+        
+        Logs: done action, review display.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for done | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        self.logger.info(f"[{session.session_token}] Done action | entered={session.get_entered_count()}/{len(session.items)}")
+        
+        # Display review (which prompts for person tag)
+        self._show_review_with_tag(session)
+        
+    def _show_review_with_tag(self, session: OrderSession):
+        """
+        Display Review screen with current person tag (if any).
+        Called after person tag is captured or updated.
+        
+        Logs: review display with tag.
+        """
+        self.logger.info(f"[{session.session_token}] Displaying Review with tag | tag='{session.person_tag}'")
+        
+        # Get delivery date
+        try:
+            summary = self.calc.generate_auto_requests(session.vendor)
+            delivery_date = summary.get("delivery_date", "—")
+        except Exception as e:
+            self.logger.error(f"[{session.session_token}] Failed to get delivery date | error={e}", exc_info=True)
+            delivery_date = "—"
+        
+        # Build review text
+        text = (
+            f"📋 <b>Review Order</b>\n"
+            f"────────────────────────────\n"
+            f"Vendor: <b>{session.vendor}</b>\n"
+            f"Order Date: <b>{session.order_date}</b>\n"
+            f"Delivery: <b>{delivery_date}</b>\n\n"
+        )
+        
+        entered_items = []
+        for item in session.items:
+            qty = session.quantities.get(item['name'])
+            if qty is not None and qty > 0:
+                entered_items.append(f"  • {qty} × {item['name']}")
+        
+        if entered_items:
+            text += f"📦 <b>Order ({len(entered_items)} items):</b>\n"
+            text += "\n".join(entered_items[:20])
+            if len(entered_items) > 20:
+                text += f"\n  ...and {len(entered_items) - 20} more"
+            text += "\n\n"
+        else:
+            text += "⚠️ No items entered.\n\n"
+        
+        # Show current person tag or prompt
+        if session.person_tag:
+            text += f"💬 Person tag: {session.person_tag}\n\n"
+            text += "<i>Type new tag to replace, or press Confirm</i>"
+        else:
+            text += "💬 <i>Type a person tag (e.g., @handle) or press Confirm</i>"
+        
+        keyboard = self._create_keyboard([
+            [("✅ Confirm", "order_confirm"), ("🔙 Back to Items", "order_review_back")],
+            [("❌ Cancel", "order_cancel")]
+        ])
+        
+        self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
+
+    def _handle_confirm(self, chat_id: int, user_id: int):
+        """
+        Post final minimal message to resolved prep chat.
+        Include delivery date, qty × item lines, and optional person tag on first line.
+        Block if no chat ID is resolvable; provide clear guidance.
+        
+        Logs: confirm action, chat resolution, idempotency check, prep chat post, success/failure.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for confirm | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        self.logger.info(f"[{session.session_token}] Confirm action | vendor={session.vendor} person_tag='{session.person_tag}'")
+        
+        # Resolve prep chat ID
+        prep_chat_id = self.bot._resolve_order_prep_chat(session.vendor, session.session_token)
+        
+        if not prep_chat_id:
+            self.logger.error(f"[{session.session_token}] Cannot confirm - no prep chat configured | vendor={session.vendor}")
+            self.bot.send_message(
+                chat_id,
+                f"⚠️ <b>Configuration Required</b>\n"
+                f"────────────────────────────\n"
+                f"No prep chat configured for {session.vendor} orders.\n\n"
+                f"<b>To fix:</b>\n"
+                f"1. Set ORDER_PREP_CHAT_ID_{session.vendor.upper()} in .env\n"
+                f"   OR\n"
+                f"2. Set ORDER_PREP_CHAT_ID (global fallback)\n"
+                f"3. Restart the bot\n\n"
+                f"Contact administrator for assistance."
+            )
+            return
+        
+        # Get delivery date
+        try:
+            summary = self.calc.generate_auto_requests(session.vendor)
+            delivery_date = summary.get("delivery_date", "—")
+            self.logger.info(f"[{session.session_token}] Delivery date retrieved | date={delivery_date}")
+        except Exception as e:
+            self.logger.error(f"[{session.session_token}] Failed to get delivery date | error={e}", exc_info=True)
+            delivery_date = "—"
+        
+        # Build final message
+        entered_items = []
+        for item in session.items:
+            qty = session.quantities.get(item['name'])
+            if qty is not None and qty > 0:
+                entered_items.append(f"• {qty} × {item['name']}")
+        
+        if not entered_items:
+            self.logger.warning(f"[{session.session_token}] Confirm with no items | blocking")
+            self.bot.send_message(chat_id, "⚠️ Cannot confirm order with no items.")
+            return
+        
+        # Build message with submitter first, then person tag if different
+        text = ""
+
+        # Show submitter name
+        if session.submitter_name:
+            text += f"{session.submitter_name}\n"
+
+        # Show person tag only if different from submitter
+        if session.person_tag and session.person_tag != session.submitter_name:
+            text += f"{session.person_tag}\n"
+            
+        text += f"Delivery: {delivery_date}\n"
+        text += "\n".join(entered_items)
+        
+        self.logger.info(f"[{session.session_token}] Order message prepared | items={len(entered_items)} tag_present={bool(session.person_tag)}")
+        
+        # Idempotency check (simple: prevent double-clicking Confirm)
+        if hasattr(session, '_confirmed'):
+            self.logger.warning(f"[{session.session_token}] Duplicate confirm attempt blocked")
+            self.bot.send_message(chat_id, "⚠️ Order already confirmed.")
+            return
+        
+        # Mark as confirmed
+        session._confirmed = True
+        
+        # Post to prep chat
+        try:
+            self.logger.info(f"[{session.session_token}] Posting to prep chat | chat_id={prep_chat_id}")
+            success = self.bot.send_message(prep_chat_id, text)
+            
+            if success:
+                self.logger.info(f"[{session.session_token}] Order posted successfully | chat={prep_chat_id} items={len(entered_items)}")
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ <b>Order Posted</b>\n"
+                    f"────────────────────────────\n"
+                    f"Order sent to {session.vendor} prep team.\n"
+                    f"Items: {len(entered_items)}\n"
+                    f"Delivery: {delivery_date}"
+                )
+                
+                # Clean up session
+                self._delete_session(user_id)
+            else:
+                self.logger.error(f"[{session.session_token}] Failed to post to prep chat | chat={prep_chat_id}")
+                session._confirmed = False  # Allow retry
+                self.bot.send_message(chat_id, "⚠️ Failed to post order. Please try again.")
+                
+        except Exception as e:
+            self.logger.error(f"[{session.session_token}] Exception posting to prep chat | chat={prep_chat_id} error={e}", exc_info=True)
+            session._confirmed = False  # Allow retry
+            self.bot.send_message(chat_id, "⚠️ Error posting order. Please try again or contact support.")
+
+    def _handle_cancel(self, chat_id: int, user_id: int):
+        """
+        Cancel and delete session, clear transient state.
+        
+        Logs: cancel action, session deletion.
+        """
+        session = self.sessions.get(user_id)
+        token = session.session_token if session else "no_session"
+        self.logger.info(f"[{token}] Cancel action | user={user_id}")
+        
+        if user_id in self.sessions:
+            self._delete_session(user_id)
+            self.bot.send_message(
+                chat_id,
+                "❌ <b>Order Cancelled</b>\n"
+                "No data saved.\n\n"
+                "Use /order to start over."
+            )
+        else:
+            self.bot.send_message(chat_id, "No active session to cancel.")
+    
+    def _resume_session(self, chat_id: int, user_id: int):
+        """
+        Resume existing session from current item.
+        
+        Logs: resume action.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for resume | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        session.update_activity()
+        self.logger.info(f"[{session.session_token}] Resume action | index={session.index}")
+        self._show_current_item(session)
+    
+    def _resume_items(self, chat_id: int, user_id: int):
+        """
+        From review, go back to first unanswered item or last item.
+        
+        Logs: resume to items action, target index.
+        """
+        session = self.sessions.get(user_id)
+        if not session:
+            self.logger.warning(f"No session for resume items | user={user_id}")
+            self.bot.send_message(chat_id, "No active session.")
+            return
+        
+        # Find first unanswered item
+        for i, item in enumerate(session.items):
+            if session.quantities.get(item['name']) is None:
+                session.index = i
+                break
+        else:
+            session.index = len(session.items) - 1
+        
+        self.logger.info(f"[{session.session_token}] Resume to items | index={session.index}")
+        self._show_current_item(session)
+    
+    def _delete_session(self, user_id: int):
+        """Delete session and log."""
+        session = self.sessions.get(user_id)
+        if session:
+            self.logger.info(f"[{session.session_token}] Session deleted | user={user_id}")
+            del self.sessions[user_id]
+    
+    def _create_keyboard(self, buttons: List[List[tuple]]) -> Dict:
+        """Create inline keyboard markup."""
+        return {
+            "inline_keyboard": [
+                [{"text": text, "callback_data": data} for text, data in row]
+                for row in buttons
+            ]
+        }
+    
+    def cleanup_expired_sessions(self):
+        """
+        Periodic cleanup of expired sessions.
+        
+        Logs: cleanup action, sessions removed.
+        """
+        expired_users = []
+        for user_id, session in self.sessions.items():
+            if session.is_expired():
+                expired_users.append(user_id)
+        
+        for user_id in expired_users:
+            self._delete_session(user_id)
+        
+        if expired_users:
+            self.logger.info(f"Cleaned up {len(expired_users)} expired order sessions")
 
 # ===== MAIN APPLICATION =====
 

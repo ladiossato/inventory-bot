@@ -16,8 +16,8 @@ Key Features:
 - Weekly and monthly ADU analysis
 
 Author: Ladios Satō
-License: Proprietary  
-Version: 3.0.0
+License: Proprietary
+Version: 4.0.0
 """
 
 import asyncio
@@ -36,7 +36,18 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 from urllib.parse import quote
 
 import requests
-SYSTEM_VERSION = "3.0.0"  # Make sure this is defined at module level
+SYSTEM_VERSION = "4.0.0"  # Make sure this is defined at module level
+
+# Fix Windows console encoding for Unicode/emoji support
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except AttributeError:
+        # Python < 3.7 fallback
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Load environment variables from .env file if it exists
 def load_env_file():
@@ -107,7 +118,72 @@ def get_time_in_timezone(timezone_str: str = None) -> datetime:
 # ===== CONFIGURATION AND CONSTANTS =====
 
 # System Configuration
-SYSTEM_VERSION = "3.0.0"
+SYSTEM_VERSION = "4.0.0"
+
+# ===== SUPABASE CLIENT (Phase 1: Dual-Write) =====
+_supabase_client = None
+_supabase_enabled = False
+
+def _init_supabase():
+    """Initialize Supabase client from environment variables."""
+    global _supabase_client, _supabase_enabled
+    try:
+        from supabase import create_client
+        url = os.environ.get('SUPABASE_URL')
+        key = os.environ.get('SUPABASE_KEY')
+
+        if url and key:
+            _supabase_client = create_client(url, key)
+            _supabase_enabled = True
+            print(f"✓ Supabase connected: {url[:40]}...")
+            print(f"[PHASE 1] Dual-write to Supabase ENABLED")
+        else:
+            print("⚠ Supabase not configured (set SUPABASE_URL and SUPABASE_KEY)")
+    except ImportError:
+        print("⚠ Supabase not installed (pip install supabase)")
+    except Exception as e:
+        print(f"⚠ Supabase init failed: {e}")
+
+_init_supabase()
+# ===== END SUPABASE CLIENT =====
+
+# ===== EXTERNAL SUPABASE CLIENT (for Operations Metrics) =====
+_external_supabase_client = None
+_external_supabase_enabled = False
+
+# South Loop kitchen location ID (from external database)
+SOUTH_LOOP_LOCATION_ID = '5e83c48c-25b8-4109-9509-155a4ab9c603'
+
+# Metric targets for operations performance
+# Note: Error rate data has a 3-day delay from the platform
+ERROR_RATE_DELAY_DAYS = 3
+
+METRIC_TARGETS = {
+    'star_rating': {'target': 4.8, 'direction': 'above'},
+    'prep_time': {'target': 9.0, 'direction': 'below'},
+    'error_rate': {'target': 0.75, 'direction': 'below'},
+}
+
+def _init_external_supabase():
+    """Initialize external Supabase client for operations metrics."""
+    global _external_supabase_client, _external_supabase_enabled
+    try:
+        from supabase import create_client
+        url = os.environ.get('EXTERNAL_SUPABASE_URL')
+        key = os.environ.get('EXTERNAL_SUPABASE_KEY')
+
+        if url and key:
+            _external_supabase_client = create_client(url, key)
+            _external_supabase_enabled = True
+            print(f"✓ External Supabase connected: {url[:40]}...")
+        else:
+            print("⚠ External Supabase not configured (optional - for ops metrics)")
+    except Exception as e:
+        print(f"⚠ External Supabase init failed: {e}")
+
+_init_external_supabase()
+# ===== END EXTERNAL SUPABASE CLIENT =====
+
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-12s | %(funcName)-20s | %(lineno)d | %(message)s"
 MAX_MEMORY_MB = 512
 MAX_LOG_SIZE_MB = 50
@@ -355,6 +431,8 @@ class InventoryItem:
     unit_type: str  # case, quart, tray, bag, bottle
     location: str  # Avondale or Commissary
     active: bool = True
+    min_par: float = 0.0  # Minimum par level (reorder point)
+    max_par: float = 0.0  # Maximum par level (order up to)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     # ===== DELIVERY / CONSUMPTION CONFIG =====
@@ -588,6 +666,1022 @@ class OrderSession:
         """Count items with non-None quantities."""
         return sum(1 for v in self.quantities.values() if v is not None)
 
+# ===== DEADLINE CHECKER =====
+
+class DeadlineChecker:
+    """
+    Background checker for order deadlines.
+
+    Runs every 5 minutes and:
+    1. Sends reminder when approaching deadline
+    2. Sends escalation when deadline missed
+
+    Logs: All checks, reminders sent, escalations
+    """
+
+    def __init__(self, notion_manager, bot):
+        self.notion = notion_manager
+        self.bot = bot
+        self.logger = logging.getLogger('deadline_checker')
+        self.running = False
+        self._thread = None
+
+        # Track what we've already notified about today (orders)
+        self._reminders_sent = set()  # (location, date) tuples
+        self._escalations_sent = set()
+
+        # Track count schedule notifications
+        self._count_reminders_sent = set()  # (location, date) tuples
+        self._count_escalations_sent = set()
+
+    def start(self):
+        """Start the deadline checker background thread."""
+        if self.running:
+            return
+
+        self.running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        print(f"[DEADLINE-CHECKER] ✓ Started background checker")
+        self.logger.info("[DEADLINE-CHECKER] Started")
+
+    def stop(self):
+        """Stop the deadline checker."""
+        self.running = False
+        print(f"[DEADLINE-CHECKER] Stopped")
+
+    def _run_loop(self):
+        """Main loop - check every 5 minutes."""
+        while self.running:
+            try:
+                self._check_all_deadlines()
+            except Exception as e:
+                print(f"[DEADLINE-CHECKER] ✗ Error in deadline check: {e}")
+                self.logger.error(f"[DEADLINE-CHECKER] Deadline error: {e}")
+
+            try:
+                self._check_all_count_schedules()
+            except Exception as e:
+                print(f"[COUNT-CHECKER] ✗ Error in count check: {e}")
+                self.logger.error(f"[COUNT-CHECKER] Error: {e}")
+
+            # Sleep for 5 minutes
+            for _ in range(300):  # 300 seconds = 5 minutes
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def _check_all_deadlines(self):
+        """Check all active deadlines."""
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+        today = now.date()
+        current_time = now.time()
+        day_of_week = now.weekday()
+
+        print(f"[DEADLINE-CHECKER] Checking deadlines at {now.strftime('%Y-%m-%d %H:%M')}")
+
+        # Get all deadlines for today
+        deadlines = self.notion.get_all_deadlines()
+
+        for dl in deadlines:
+            if dl['day_of_week'] != day_of_week:
+                continue
+
+            location = dl['location']
+            deadline_hour = dl['deadline_hour']
+            deadline_minute = dl['deadline_minute']
+            reminder_minutes = dl.get('reminder_minutes_before', 60)
+            notification_chat = dl.get('notification_chat_id')
+            escalation_chat = dl.get('escalation_chat_id')
+
+            # Create deadline datetime
+            deadline_time = datetime.combine(today,
+                datetime.strptime(f"{deadline_hour:02d}:{deadline_minute:02d}", "%H:%M").time())
+            reminder_time = deadline_time - timedelta(minutes=reminder_minutes)
+
+            # Current datetime for comparison
+            current_datetime = datetime.combine(today, current_time)
+
+            key = (location, today.isoformat())
+
+            # Check if order already submitted
+            order_submitted = self.notion.check_order_submitted_today(location)
+
+            if order_submitted:
+                print(f"[DEADLINE-CHECKER] {location}: Order already submitted ✓")
+                continue
+
+            # Check for reminder window
+            if (reminder_time <= current_datetime < deadline_time and
+                key not in self._reminders_sent):
+
+                self._send_reminder(location, deadline_time, notification_chat)
+                self._reminders_sent.add(key)
+                self.notion.log_deadline_event(location, 'reminder_sent')
+
+            # Check for missed deadline
+            if (current_datetime >= deadline_time and
+                key not in self._escalations_sent):
+
+                self._send_escalation(location, deadline_time, escalation_chat, notification_chat)
+                self._escalations_sent.add(key)
+                self.notion.log_deadline_event(location, 'deadline_missed')
+                self.notion.log_deadline_event(location, 'escalation_sent')
+
+        # Clear old entries (from previous days)
+        self._reminders_sent = {k for k in self._reminders_sent if k[1] == today.isoformat()}
+        self._escalations_sent = {k for k in self._escalations_sent if k[1] == today.isoformat()}
+
+    def _send_reminder(self, location: str, deadline_time: datetime, chat_id: int):
+        """Send reminder notification."""
+        if not chat_id:
+            print(f"[DEADLINE-CHECKER] ⚠ No notification chat for {location}")
+            return
+
+        time_str = deadline_time.strftime('%I:%M %p')
+
+        message = (
+            f"⏰ <b>ORDER REMINDER</b>\n\n"
+            f"📍 <b>{location}</b> order due at {time_str}\n\n"
+            f"Use /order to submit before deadline!"
+        )
+
+        try:
+            self.bot.send_message(chat_id, message)
+            print(f"[DEADLINE-CHECKER] ✓ Reminder sent for {location}")
+            self.logger.info(f"[DEADLINE-CHECKER] Reminder sent: {location}")
+        except Exception as e:
+            print(f"[DEADLINE-CHECKER] ✗ Failed to send reminder: {e}")
+
+    def _send_escalation(self, location: str, deadline_time: datetime,
+                         escalation_chat: int, notification_chat: int):
+        """Send escalation notification."""
+        time_str = deadline_time.strftime('%I:%M %p')
+
+        message = (
+            f"🚨 <b>DEADLINE MISSED</b>\n\n"
+            f"📍 <b>{location}</b> order was due at {time_str}\n"
+            f"⚠️ No order has been submitted!\n\n"
+            f"Please submit immediately or contact manager."
+        )
+
+        # Send to escalation chat (admin)
+        if escalation_chat:
+            try:
+                self.bot.send_message(escalation_chat, message)
+                print(f"[DEADLINE-CHECKER] ✓ Escalation sent to admin for {location}")
+            except Exception as e:
+                print(f"[DEADLINE-CHECKER] ✗ Failed to send escalation: {e}")
+
+        # Also send to notification chat (team)
+        if notification_chat and notification_chat != escalation_chat:
+            try:
+                self.bot.send_message(notification_chat, message)
+                print(f"[DEADLINE-CHECKER] ✓ Escalation sent to team for {location}")
+            except Exception as e:
+                print(f"[DEADLINE-CHECKER] ✗ Failed to send team escalation: {e}")
+
+        self.logger.warning(f"[DEADLINE-CHECKER] MISSED DEADLINE: {location}")
+
+    # ===== COUNT SCHEDULE CHECKING =====
+
+    def _check_all_count_schedules(self):
+        """Check all count schedules and send reminders/escalations."""
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+        today = now.date()
+        current_time = now.time()
+        day_of_week = now.weekday()
+
+        print(f"[COUNT-CHECKER] Checking count schedules at {now.strftime('%Y-%m-%d %H:%M')}")
+
+        # Get all count schedules for today
+        schedules = self.notion.get_all_count_schedules()
+
+        for sched in schedules:
+            if sched['day_of_week'] != day_of_week:
+                continue
+
+            location = sched['location']
+            due_hour = sched['due_hour']
+            due_minute = sched['due_minute']
+            reminder_minutes = sched.get('reminder_minutes_before', 60)
+            notification_chat = sched.get('notification_chat_id')
+            escalation_chat = sched.get('escalation_chat_id')
+
+            # Create due datetime
+            due_time = datetime.combine(today,
+                datetime.strptime(f"{due_hour:02d}:{due_minute:02d}", "%H:%M").time())
+            reminder_time = due_time - timedelta(minutes=reminder_minutes)
+
+            # Current datetime for comparison
+            current_datetime = datetime.combine(today, current_time)
+
+            key = (location, today.isoformat())
+
+            # Check if count already submitted
+            count_submitted = self.notion.check_count_submitted_today(location)
+
+            if count_submitted:
+                print(f"[COUNT-CHECKER] {location}: Count already submitted ✓")
+                continue
+
+            # Check for reminder window
+            if (reminder_time <= current_datetime < due_time and
+                key not in self._count_reminders_sent):
+
+                self._send_count_reminder(location, due_time, notification_chat)
+                self._count_reminders_sent.add(key)
+                self.notion.log_count_event(location, 'count_reminder_sent')
+
+            # Check for missed count deadline
+            if (current_datetime >= due_time and
+                key not in self._count_escalations_sent):
+
+                self._send_count_escalation(location, due_time, escalation_chat, notification_chat)
+                self._count_escalations_sent.add(key)
+                self.notion.log_count_event(location, 'count_missed')
+                self.notion.log_count_event(location, 'count_escalation_sent')
+
+        # Clear old entries (from previous days)
+        self._count_reminders_sent = {k for k in self._count_reminders_sent if k[1] == today.isoformat()}
+        self._count_escalations_sent = {k for k in self._count_escalations_sent if k[1] == today.isoformat()}
+
+    def _send_count_reminder(self, location: str, due_time: datetime, chat_id: int):
+        """Send count reminder notification."""
+        if not chat_id:
+            print(f"[COUNT-CHECKER] ⚠ No notification chat for {location}")
+            return
+
+        time_str = due_time.strftime('%I:%M %p')
+
+        message = (
+            f"📋 <b>COUNT REMINDER</b>\n\n"
+            f"📍 <b>{location}</b> inventory count due at {time_str}\n\n"
+            f"Use /entry → On-Hand to submit your count!"
+        )
+
+        try:
+            self.bot.send_message(chat_id, message)
+            print(f"[COUNT-CHECKER] ✓ Reminder sent for {location}")
+            self.logger.info(f"[COUNT-CHECKER] Reminder sent: {location}")
+        except Exception as e:
+            print(f"[COUNT-CHECKER] ✗ Failed to send reminder: {e}")
+
+    def _send_count_escalation(self, location: str, due_time: datetime,
+                               escalation_chat: int, notification_chat: int):
+        """Send count missed escalation notification."""
+        time_str = due_time.strftime('%I:%M %p')
+
+        message = (
+            f"🚨 <b>COUNT MISSED</b>\n\n"
+            f"📍 <b>{location}</b> inventory count was due at {time_str}\n"
+            f"⚠️ No count has been submitted!\n\n"
+            f"Please submit immediately using /entry → On-Hand"
+        )
+
+        # Send to escalation chat (admin)
+        if escalation_chat:
+            try:
+                self.bot.send_message(escalation_chat, message)
+                print(f"[COUNT-CHECKER] ✓ Escalation sent to admin for {location}")
+            except Exception as e:
+                print(f"[COUNT-CHECKER] ✗ Failed to send escalation: {e}")
+
+        # Also send to notification chat (team)
+        if notification_chat and notification_chat != escalation_chat:
+            try:
+                self.bot.send_message(notification_chat, message)
+                print(f"[COUNT-CHECKER] ✓ Escalation sent to team for {location}")
+            except Exception as e:
+                print(f"[COUNT-CHECKER] ✗ Failed to send team escalation: {e}")
+
+        self.logger.warning(f"[COUNT-CHECKER] MISSED COUNT: {location}")
+
+    # ===== END COUNT SCHEDULE CHECKING =====
+
+# ===== END DEADLINE CHECKER =====
+
+# ===== TASK ASSIGNMENT CHECKER =====
+
+class TaskAssignmentChecker:
+    """
+    Background checker for task assignment reminders.
+
+    Runs every 5 minutes and:
+    1. Checks task_assignments table for pending tasks
+    2. Sends reminders 30 minutes before due_time
+    3. Respects start_time and end_time windows
+
+    Works alongside DeadlineChecker for comprehensive reminder coverage.
+    """
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.logger = logging.getLogger('task_assignment_checker')
+        self.running = False
+        self._thread = None
+        self._reminders_sent = set()  # (task_id, date) tuples
+
+    def start(self):
+        """Start the task assignment checker background thread."""
+        if self.running:
+            return
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[TASK-CHECKER] ⚠ Supabase not available, skipping task checker")
+            return
+
+        self.running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        print(f"[TASK-CHECKER] ✓ Started background checker")
+        self.logger.info("[TASK-CHECKER] Started")
+
+    def stop(self):
+        """Stop the task assignment checker."""
+        self.running = False
+        print(f"[TASK-CHECKER] Stopped")
+
+    def _run_loop(self):
+        """Main loop - check every 5 minutes."""
+        while self.running:
+            try:
+                self._check_task_reminders()
+            except Exception as e:
+                print(f"[TASK-CHECKER] ✗ Error in task check: {e}")
+                self.logger.error(f"[TASK-CHECKER] Error: {e}")
+
+            # Sleep for 5 minutes
+            for _ in range(300):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def _check_task_reminders(self):
+        """Check for task assignments that need reminders."""
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+        today = now.strftime('%Y-%m-%d')
+        current_time = now.strftime('%H:%M')
+
+        print(f"[TASK-CHECKER] Checking task reminders at {now.strftime('%Y-%m-%d %H:%M')}")
+
+        try:
+            # Get tasks due today that haven't been reminded
+            tasks_result = _supabase_client.table('task_assignments') \
+                .select('*, report_types(name), telegram_users!task_assignments_assigned_to_fkey(telegram_id, name)') \
+                .eq('scheduled_date', today) \
+                .eq('reminder_sent', False) \
+                .eq('status', 'pending') \
+                .execute()
+
+            if not tasks_result.data:
+                print(f"[TASK-CHECKER] No pending tasks needing reminders")
+                return
+
+            for task in tasks_result.data:
+                due_time = task.get('due_time')
+                if not due_time:
+                    continue
+
+                # Parse due time (HH:MM:SS or HH:MM)
+                due_parts = due_time.split(':')
+                due_hour = int(due_parts[0])
+                due_minute = int(due_parts[1]) if len(due_parts) > 1 else 0
+
+                # Calculate reminder threshold (30 mins before)
+                reminder_dt = datetime(now.year, now.month, now.day, due_hour, due_minute) - timedelta(minutes=30)
+                reminder_threshold = reminder_dt.strftime('%H:%M')
+                due_str = f"{due_hour:02d}:{due_minute:02d}"
+
+                # Check if we should send reminder
+                if current_time >= reminder_threshold and current_time < due_str:
+                    key = (task['id'], today)
+                    if key not in self._reminders_sent:
+                        self._send_task_reminder(task, due_time)
+                        self._reminders_sent.add(key)
+
+            # Clear old entries (from previous days)
+            self._reminders_sent = {k for k in self._reminders_sent if k[1] == today}
+
+        except Exception as e:
+            self.logger.error(f"[TASK-CHECKER] Error fetching tasks: {e}")
+            print(f"[TASK-CHECKER] ✗ Error: {e}")
+
+    def _send_task_reminder(self, task: dict, due_time: str):
+        """Send reminder for a specific task."""
+        # Get user info
+        user_data = task.get('telegram_users')
+        if not user_data:
+            print(f"[TASK-CHECKER] ⚠ No user data for task {task['id']}")
+            return
+
+        telegram_id = user_data.get('telegram_id')
+        user_name = user_data.get('name', 'User')
+        if not telegram_id:
+            print(f"[TASK-CHECKER] ⚠ No telegram_id for task {task['id']}")
+            return
+
+        # Get task name
+        report_types = task.get('report_types')
+        if report_types and report_types.get('name'):
+            task_name = report_types['name']
+        else:
+            task_name = task.get('notes') or 'Task'
+
+        # Format due time for display
+        due_parts = due_time.split(':')
+        hour = int(due_parts[0])
+        minute = due_parts[1] if len(due_parts) > 1 else '00'
+        period = 'AM' if hour < 12 else 'PM'
+        display_hour = hour % 12 or 12
+        due_str = f"{display_hour}:{minute} {period}"
+
+        message = (
+            f"⏰ <b>Task Reminder</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 <b>{task_name}</b>\n"
+            f"⏱️ Due at {due_str}\n\n"
+            f"Use /viewtasks to see all your pending tasks."
+        )
+
+        try:
+            self.bot.send_message(telegram_id, message)
+            print(f"[TASK-CHECKER] ✓ Reminder sent for task {task['id']} to {user_name}")
+
+            # Mark as reminded in database
+            _supabase_client.table('task_assignments') \
+                .update({
+                    'reminder_sent': True,
+                    'reminder_sent_at': datetime.now().isoformat()
+                }) \
+                .eq('id', task['id']) \
+                .execute()
+
+        except Exception as e:
+            print(f"[TASK-CHECKER] ✗ Failed to send reminder: {e}")
+            self.logger.error(f"[TASK-CHECKER] Failed to send reminder: {e}")
+
+# ===== END TASK ASSIGNMENT CHECKER =====
+
+# ===== SCHEDULED MESSAGE SENDER =====
+
+class ScheduledMessageSender:
+    """
+    Background sender for scheduled messages.
+
+    Runs every minute and:
+    1. Checks scheduled_messages table for due messages
+    2. Generates and sends metrics summaries or task reports
+    3. Updates last_sent_at and next_run_at timestamps
+    """
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.logger = logging.getLogger('scheduled_message_sender')
+        self.running = False
+        self._thread = None
+
+    def start(self):
+        """Start the scheduled message sender background thread."""
+        if self.running:
+            return
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[SCHEDULED-MSG] ⚠ Supabase not available, skipping message sender")
+            return
+
+        self.running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        print(f"[SCHEDULED-MSG] ✓ Started background sender")
+        self.logger.info("[SCHEDULED-MSG] Started")
+
+    def stop(self):
+        """Stop the scheduled message sender."""
+        self.running = False
+        print(f"[SCHEDULED-MSG] Stopped")
+
+    def _run_loop(self):
+        """Main loop - check every minute."""
+        while self.running:
+            try:
+                self._check_scheduled_messages()
+            except Exception as e:
+                print(f"[SCHEDULED-MSG] ✗ Error in message check: {e}")
+                self.logger.error(f"[SCHEDULED-MSG] Error: {e}")
+
+            # Sleep for 60 seconds (check every minute)
+            for _ in range(60):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def _check_scheduled_messages(self):
+        """Check for scheduled messages that need to be sent."""
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+        current_day = now.strftime('%A').lower()  # monday, tuesday, etc.
+        current_time = now.strftime('%H:%M')
+
+        try:
+            # Get active scheduled messages
+            messages_result = _supabase_client.table('scheduled_messages') \
+                .select('*') \
+                .eq('is_active', True) \
+                .execute()
+
+            if not messages_result.data:
+                return
+
+            for message in messages_result.data:
+                if self._should_send(message, now, current_day, current_time):
+                    self._send_scheduled_message(message, now)
+
+        except Exception as e:
+            self.logger.error(f"[SCHEDULED-MSG] Error fetching messages: {e}")
+            print(f"[SCHEDULED-MSG] ✗ Error: {e}")
+
+    def _should_send(self, message: dict, now: datetime, current_day: str, current_time: str) -> bool:
+        """Check if a message should be sent now."""
+        schedule_time = message.get('schedule_time', '')[:5]  # Get HH:MM
+
+        # Check if it's time (within 1 minute window)
+        if current_time != schedule_time:
+            return False
+
+        # Check last_sent_at to avoid duplicates
+        last_sent = message.get('last_sent_at')
+        if last_sent:
+            last_sent_dt = datetime.fromisoformat(last_sent.replace('Z', '+00:00'))
+            if (now - last_sent_dt.replace(tzinfo=None)).total_seconds() < 300:  # 5 min debounce
+                return False
+
+        # For recurring messages, check day
+        if message.get('is_recurring') and message.get('schedule_days'):
+            if current_day not in message['schedule_days']:
+                return False
+
+        return True
+
+    def _send_scheduled_message(self, message: dict, now: datetime):
+        """Send a scheduled message and update database."""
+        recipient_id = message.get('recipient_id')
+        if not recipient_id:
+            return
+
+        message_type = message.get('message_type', 'custom')
+
+        try:
+            # Generate message content based on type
+            if message_type == 'metrics_summary':
+                content = self._generate_metrics_summary(message, now)
+            elif message_type == 'task_report':
+                content = self._generate_task_report(message, now)
+            else:
+                # Custom message with template variables
+                template = message.get('custom_content', '')
+                if template:
+                    variables = self._collect_template_variables(message, now)
+                    content = self._render_template(template, variables)
+                else:
+                    content = f"📊 <b>{message.get('name', 'Scheduled Message')}</b>\n\nNo message template configured."
+
+            # Send the message
+            self.bot.send_message(int(recipient_id), content)
+            print(f"[SCHEDULED-MSG] ✓ Sent '{message['name']}' to {recipient_id}")
+
+            # Update last_sent_at and calculate next_run_at
+            next_run = self._calculate_next_run(message, now)
+            _supabase_client.table('scheduled_messages') \
+                .update({
+                    'last_sent_at': now.isoformat(),
+                    'next_run_at': next_run.isoformat() if next_run else None
+                }) \
+                .eq('id', message['id']) \
+                .execute()
+
+        except Exception as e:
+            print(f"[SCHEDULED-MSG] ✗ Failed to send message: {e}")
+            self.logger.error(f"[SCHEDULED-MSG] Failed to send: {e}")
+
+    def _generate_metrics_summary(self, message: dict, now: datetime) -> str:
+        """Generate a metrics summary message."""
+        date_range = message.get('date_range_type', 'yesterday')
+
+        # Calculate date range
+        if date_range == 'yesterday':
+            end_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+            start_date = end_date
+            period_label = "Yesterday"
+        elif date_range == 'last_week':
+            end_date = now.strftime('%Y-%m-%d')
+            start_date = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+            period_label = "Last 7 Days"
+        elif date_range == 'last_month':
+            end_date = now.strftime('%Y-%m-%d')
+            start_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            period_label = "Last 30 Days"
+        else:
+            start_date = message.get('custom_date_start') or now.strftime('%Y-%m-%d')
+            end_date = message.get('custom_date_end') or now.strftime('%Y-%m-%d')
+            period_label = f"{start_date} to {end_date}"
+
+        try:
+            # Fetch metrics from Supabase
+            # Get task completion rate
+            tasks_result = _supabase_client.table('task_assignments') \
+                .select('status') \
+                .gte('scheduled_date', start_date) \
+                .lte('scheduled_date', end_date) \
+                .execute()
+
+            total_tasks = len(tasks_result.data) if tasks_result.data else 0
+            completed_tasks = sum(1 for t in (tasks_result.data or []) if t.get('status') == 'completed')
+            task_completion = round((completed_tasks / total_tasks * 100) if total_tasks > 0 else 0, 1)
+
+            # Get flagged cycles
+            cycles_result = _supabase_client.table('consumption_cycles') \
+                .select('status') \
+                .gte('created_at', start_date) \
+                .lte('created_at', end_date) \
+                .execute()
+
+            total_cycles = len(cycles_result.data) if cycles_result.data else 0
+            flagged_cycles = sum(1 for c in (cycles_result.data or []) if c.get('status') == 'flagged')
+            flagged_rate = round((flagged_cycles / total_cycles * 100) if total_cycles > 0 else 0, 1)
+
+            # Get audit scores
+            audits_result = _supabase_client.table('food_safety_audits') \
+                .select('score_percentage') \
+                .gte('audit_date', start_date) \
+                .lte('audit_date', end_date) \
+                .execute()
+
+            audit_scores = [a.get('score_percentage', 0) for a in (audits_result.data or []) if a.get('score_percentage')]
+            avg_audit = round(sum(audit_scores) / len(audit_scores), 1) if audit_scores else 0
+
+            # Build message
+            content = (
+                f"📊 <b>Metrics Summary</b>\n"
+                f"<i>{period_label}</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"✅ <b>Task Completion:</b> {task_completion}%\n"
+                f"   ({completed_tasks} of {total_tasks} tasks)\n\n"
+                f"🚩 <b>Flagged Cycle Rate:</b> {flagged_rate}%\n"
+                f"   ({flagged_cycles} of {total_cycles} cycles)\n\n"
+                f"📋 <b>Audit Score Avg:</b> {avg_audit}%\n"
+                f"   ({len(audit_scores)} audits)\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>Report: {message.get('name', 'Metrics')}</i>"
+            )
+
+            return content
+
+        except Exception as e:
+            self.logger.error(f"[SCHEDULED-MSG] Error generating metrics: {e}")
+            return f"📊 <b>Metrics Summary</b>\n\n⚠️ Error generating report: {str(e)}"
+
+    def _generate_task_report(self, message: dict, now: datetime) -> str:
+        """Generate a task completion report."""
+        date_range = message.get('date_range_type', 'yesterday')
+
+        # Calculate date range
+        if date_range == 'yesterday':
+            target_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+            period_label = "Yesterday"
+        else:
+            target_date = now.strftime('%Y-%m-%d')
+            period_label = "Today"
+
+        try:
+            # Get all tasks for the date
+            tasks_result = _supabase_client.table('task_assignments') \
+                .select('*, report_types(name), telegram_users!task_assignments_assigned_to_fkey(name)') \
+                .eq('scheduled_date', target_date) \
+                .execute()
+
+            if not tasks_result.data:
+                return f"📋 <b>Task Report - {period_label}</b>\n\nNo tasks scheduled."
+
+            # Group by status
+            completed = []
+            pending = []
+            missed = []
+
+            for task in tasks_result.data:
+                status = task.get('status', 'pending')
+                task_name = task.get('report_types', {}).get('name') or task.get('notes') or 'Task'
+                assignee = task.get('telegram_users', {}).get('name') or 'Unassigned'
+
+                task_info = f"• {task_name} ({assignee})"
+
+                if status == 'completed':
+                    completed.append(task_info)
+                elif status == 'missed':
+                    missed.append(task_info)
+                else:
+                    pending.append(task_info)
+
+            # Build message
+            content = (
+                f"📋 <b>Task Report - {period_label}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            )
+
+            if completed:
+                content += f"✅ <b>Completed ({len(completed)})</b>\n"
+                content += "\n".join(completed[:5])  # Limit to 5
+                if len(completed) > 5:
+                    content += f"\n... and {len(completed) - 5} more"
+                content += "\n\n"
+
+            if pending:
+                content += f"⏳ <b>Pending ({len(pending)})</b>\n"
+                content += "\n".join(pending[:5])
+                if len(pending) > 5:
+                    content += f"\n... and {len(pending) - 5} more"
+                content += "\n\n"
+
+            if missed:
+                content += f"❌ <b>Missed ({len(missed)})</b>\n"
+                content += "\n".join(missed[:5])
+                if len(missed) > 5:
+                    content += f"\n... and {len(missed) - 5} more"
+                content += "\n\n"
+
+            total = len(completed) + len(pending) + len(missed)
+            completion_rate = round(len(completed) / total * 100) if total > 0 else 0
+
+            content += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            content += f"<b>Completion Rate:</b> {completion_rate}%"
+
+            return content
+
+        except Exception as e:
+            self.logger.error(f"[SCHEDULED-MSG] Error generating task report: {e}")
+            return f"📋 <b>Task Report</b>\n\n⚠️ Error generating report: {str(e)}"
+
+    def _collect_template_variables(self, message: dict, now: datetime) -> dict:
+        """Collect all available template variables for scheduled messages."""
+        date_range = message.get('date_range_type', 'yesterday')
+
+        # Calculate date range
+        if date_range == 'yesterday':
+            end_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+            start_date = end_date
+            period_label = "Yesterday"
+        elif date_range == 'last_week':
+            end_date = now.strftime('%Y-%m-%d')
+            start_date = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+            period_label = "Last 7 Days"
+        elif date_range == 'last_month':
+            end_date = now.strftime('%Y-%m-%d')
+            start_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            period_label = "Last 30 Days"
+        else:
+            start_date = message.get('custom_date_start') or now.strftime('%Y-%m-%d')
+            end_date = message.get('custom_date_end') or now.strftime('%Y-%m-%d')
+            period_label = f"{start_date} to {end_date}"
+
+        variables = {
+            'report_name': message.get('name', 'Report'),
+            'period_label': period_label,
+            'start_date': start_date,
+            'end_date': end_date,
+        }
+
+        try:
+            # Get task metrics
+            tasks_result = _supabase_client.table('task_assignments') \
+                .select('status, scheduled_date') \
+                .gte('scheduled_date', start_date) \
+                .lte('scheduled_date', end_date) \
+                .execute()
+
+            total_tasks = len(tasks_result.data) if tasks_result.data else 0
+            completed_tasks = sum(1 for t in (tasks_result.data or []) if t.get('status') == 'completed')
+            pending_tasks = sum(1 for t in (tasks_result.data or []) if t.get('status') == 'pending')
+            missed_tasks = sum(1 for t in (tasks_result.data or []) if t.get('status') == 'missed')
+            task_completion = round((completed_tasks / total_tasks * 100) if total_tasks > 0 else 0, 1)
+
+            # Calculate overdue tasks (pending with scheduled_date < today)
+            today = now.strftime('%Y-%m-%d')
+            overdue_tasks = sum(1 for t in (tasks_result.data or [])
+                               if t.get('status') == 'pending' and t.get('scheduled_date', '') < today)
+
+            variables['task_completion'] = task_completion
+            variables['completed_tasks'] = completed_tasks
+            variables['total_tasks'] = total_tasks
+            variables['pending_tasks'] = pending_tasks
+            variables['missed_tasks'] = missed_tasks
+            variables['overdue_tasks'] = overdue_tasks
+
+            # Get cycle metrics
+            cycles_result = _supabase_client.table('consumption_cycles') \
+                .select('status') \
+                .gte('created_at', start_date) \
+                .lte('created_at', end_date) \
+                .execute()
+
+            total_cycles = len(cycles_result.data) if cycles_result.data else 0
+            flagged_cycles = sum(1 for c in (cycles_result.data or []) if c.get('status') == 'flagged')
+            flagged_rate = round((flagged_cycles / total_cycles * 100) if total_cycles > 0 else 0, 1)
+
+            variables['flagged_rate'] = flagged_rate
+            variables['flagged_cycles'] = flagged_cycles
+            variables['total_cycles'] = total_cycles
+
+            # Get audit metrics
+            audits_result = _supabase_client.table('food_safety_audits') \
+                .select('score_percentage') \
+                .gte('audit_date', start_date) \
+                .lte('audit_date', end_date) \
+                .execute()
+
+            audit_scores = [a.get('score_percentage', 0) for a in (audits_result.data or []) if a.get('score_percentage')]
+            avg_audit = round(sum(audit_scores) / len(audit_scores), 1) if audit_scores else 0
+            total_audits = len(audits_result.data) if audits_result.data else 0
+            passed_audits = sum(1 for a in (audits_result.data or []) if (a.get('score_percentage') or 0) >= 90)
+
+            variables['avg_audit_score'] = avg_audit
+            variables['total_audits'] = total_audits
+            variables['passed_audits'] = passed_audits
+
+            # Get flagged transactions count
+            flagged_tx_result = _supabase_client.table('inventory_transactions') \
+                .select('id') \
+                .eq('flagged', True) \
+                .execute()
+            variables['flagged_transactions'] = len(flagged_tx_result.data) if flagged_tx_result.data else 0
+
+        except Exception as e:
+            self.logger.error(f"[SCHEDULED-MSG] Error collecting variables: {e}")
+            # Set defaults on error
+            variables.update({
+                'task_completion': 0, 'completed_tasks': 0, 'total_tasks': 0,
+                'pending_tasks': 0, 'missed_tasks': 0, 'overdue_tasks': 0,
+                'flagged_rate': 0, 'flagged_cycles': 0, 'total_cycles': 0,
+                'avg_audit_score': 0, 'total_audits': 0, 'passed_audits': 0,
+                'flagged_transactions': 0
+            })
+
+        # Get external operations metrics
+        try:
+            if _external_supabase_enabled and _external_supabase_client:
+                # Calculate ISO date range for external queries
+                start_iso = f"{start_date}T00:00:00"
+                end_iso = f"{end_date}T23:59:59"
+
+                # Fetch star rating from events table
+                star_result = _external_supabase_client.table('events') \
+                    .select('metadata') \
+                    .eq('location_id', SOUTH_LOOP_LOCATION_ID) \
+                    .in_('event_type', ['order_rating_good', 'order_rating_low']) \
+                    .gte('timestamp', start_iso) \
+                    .lte('timestamp', end_iso) \
+                    .execute()
+
+                ratings = [e.get('metadata', {}).get('rating') for e in (star_result.data or [])
+                           if isinstance(e.get('metadata', {}).get('rating'), (int, float))]
+                star_rating = round(sum(ratings) / len(ratings), 2) if ratings else None
+
+                # Fetch prep time from events table
+                prep_result = _external_supabase_client.table('events') \
+                    .select('metadata') \
+                    .eq('location_id', SOUTH_LOOP_LOCATION_ID) \
+                    .eq('event_type', 'prep_time_slow') \
+                    .gte('timestamp', start_iso) \
+                    .lte('timestamp', end_iso) \
+                    .execute()
+
+                prep_times = [e.get('metadata', {}).get('avg_prep_time_minutes') for e in (prep_result.data or [])
+                              if isinstance(e.get('metadata', {}).get('avg_prep_time_minutes'), (int, float))]
+                prep_time = round(sum(prep_times) / len(prep_times), 1) if prep_times else None
+
+                # Fetch error rate (errors / total orders)
+                # Note: Error rate has a 3-day delay, so we fetch the most recent N days of AVAILABLE data
+                # For example: on Jan 1 with 3-day delay, "last 7 days" = Dec 23-29 (most recent 7 available days)
+                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                period_days = (end_dt - start_dt).days  # Period as day difference
+
+                # End date is most recent available (end_date - delay)
+                delayed_end_dt = end_dt - timedelta(days=ERROR_RATE_DELAY_DAYS)
+
+                # Start date calculation:
+                # - For single day (daily): same as delayed end (period_days=0 -> adjusted=0)
+                # - For multi-day (weekly/monthly): preserve N days, subtract (period - 1) days
+                # Examples with 3-day delay on Jan 1:
+                #   - Yesterday (Dec 31): Dec 28 (single day of available data)
+                #   - Last 7 days (Dec 25-Jan 1): Dec 23-29 (7 days of available data)
+                adjusted_period = max(0, period_days - 1)
+                delayed_start_dt = delayed_end_dt - timedelta(days=adjusted_period)
+
+                delayed_start = delayed_start_dt.strftime('%Y-%m-%d')
+                delayed_end = delayed_end_dt.strftime('%Y-%m-%d')
+                delayed_start_iso = f"{delayed_start}T00:00:00Z"
+                delayed_end_iso = f"{delayed_end}T23:59:59Z"
+
+                error_result = _external_supabase_client.table('events') \
+                    .select('id') \
+                    .eq('location_id', SOUTH_LOOP_LOCATION_ID) \
+                    .eq('event_type', 'order_error') \
+                    .gte('timestamp', delayed_start_iso) \
+                    .lte('timestamp', delayed_end_iso) \
+                    .execute()
+
+                sales_result = _external_supabase_client.table('sales_data') \
+                    .select('order_count') \
+                    .eq('location_id', SOUTH_LOOP_LOCATION_ID) \
+                    .gte('date', delayed_start) \
+                    .lte('date', delayed_end) \
+                    .execute()
+
+                total_errors = len(error_result.data) if error_result.data else 0
+                total_orders = sum(s.get('order_count', 0) for s in (sales_result.data or []))
+                error_rate = round((total_errors / total_orders) * 100, 2) if total_orders > 0 else None
+
+                # Calculate status (HIT/MISS) for each metric
+                def get_status(value, target, direction):
+                    if value is None:
+                        return '—'
+                    if direction == 'above':
+                        return 'HIT' if value >= target else 'MISS'
+                    else:  # below
+                        return 'HIT' if value <= target else 'MISS'
+
+                variables['star_rating'] = f"{star_rating:.2f}" if star_rating is not None else '—'
+                variables['prep_time'] = f"{prep_time:.1f}" if prep_time is not None else '—'
+                variables['error_rate'] = f"{error_rate:.2f}" if error_rate is not None else '—'
+
+                variables['star_status'] = get_status(star_rating, METRIC_TARGETS['star_rating']['target'], METRIC_TARGETS['star_rating']['direction'])
+                variables['prep_status'] = get_status(prep_time, METRIC_TARGETS['prep_time']['target'], METRIC_TARGETS['prep_time']['direction'])
+                variables['error_status'] = get_status(error_rate, METRIC_TARGETS['error_rate']['target'], METRIC_TARGETS['error_rate']['direction'])
+            else:
+                # External Supabase not configured
+                variables['star_rating'] = '—'
+                variables['prep_time'] = '—'
+                variables['error_rate'] = '—'
+                variables['star_status'] = '—'
+                variables['prep_status'] = '—'
+                variables['error_status'] = '—'
+
+        except Exception as e:
+            self.logger.error(f"[SCHEDULED-MSG] Error fetching external metrics: {e}")
+            variables['star_rating'] = '—'
+            variables['prep_time'] = '—'
+            variables['error_rate'] = '—'
+            variables['star_status'] = '—'
+            variables['prep_status'] = '—'
+            variables['error_status'] = '—'
+
+        return variables
+
+    def _render_template(self, template: str, variables: dict) -> str:
+        """Replace {{variable}} placeholders in template with actual values."""
+        import re
+        result = template
+
+        # Replace all {{variable}} patterns
+        for key, value in variables.items():
+            result = result.replace(f'{{{{{key}}}}}', str(value))
+
+        # Remove any remaining unreplaced variables
+        result = re.sub(r'\{\{[^}]+\}\}', '—', result)
+
+        return result
+
+    def _calculate_next_run(self, message: dict, now: datetime) -> Optional[datetime]:
+        """Calculate the next run time for a recurring message."""
+        if not message.get('is_recurring') or not message.get('schedule_days'):
+            return None
+
+        schedule_time = message.get('schedule_time', '08:00')[:5]
+        schedule_days = message['schedule_days']
+
+        time_parts = schedule_time.split(':')
+        hour = int(time_parts[0])
+        minute = int(time_parts[1]) if len(time_parts) > 1 else 0
+
+        day_map = {
+            'sunday': 6, 'monday': 0, 'tuesday': 1, 'wednesday': 2,
+            'thursday': 3, 'friday': 4, 'saturday': 5
+        }
+
+        # Start checking from tomorrow
+        for days_ahead in range(1, 8):
+            check_date = now + timedelta(days=days_ahead)
+            day_name = check_date.strftime('%A').lower()
+
+            if day_name in schedule_days:
+                return datetime(
+                    check_date.year, check_date.month, check_date.day,
+                    hour, minute, 0
+                )
+
+        return None
+
+# ===== END SCHEDULED MESSAGE SENDER =====
+
 # ===== NOTION DATABASE MANAGER =====
 
 class NotionManager:
@@ -645,7 +1739,1488 @@ class NotionManager:
         
         # Initialize system on first run
         self._initialize_system()
-    
+
+    def _write_to_supabase(self, table: str, data: dict) -> bool:
+        """
+        Shadow write to Supabase for dual-write validation.
+        Fails silently — Notion remains primary.
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return True
+
+        try:
+            _supabase_client.table(table).insert(data).execute()
+            self.logger.debug(f"Supabase write to {table}: success")
+            print(f"[PHASE 1] ✓ Dual-write to Supabase table '{table}' successful")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Supabase write to {table} failed: {e}")
+            print(f"[PHASE 1] ⚠ Dual-write to Supabase table '{table}' failed: {e}")
+            return False
+
+    def _read_items_from_supabase(self, vendor: str):
+        """
+        Read items from Supabase for a vendor with PAR fields.
+
+        Returns list of InventoryItem objects with min_par/max_par populated.
+        Logs: query execution, item count, par coverage stats.
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[PAR] Supabase not available, falling back to Notion")
+            return None
+
+        try:
+            print(f"[PAR] Loading items from Supabase for vendor: {vendor}")
+
+            result = _supabase_client.table('inventory_items') \
+                .select('id, item_name, vendor, unit_type, avg_consumption, min_par, max_par, active, created_at, updated_at') \
+                .eq('vendor', vendor) \
+                .eq('active', True) \
+                .order('item_name') \
+                .execute()
+
+            items = []
+            pars_configured = 0
+            pars_missing = 0
+
+            for row in result.data:
+                min_par = row.get('min_par')
+                max_par = row.get('max_par')
+                item_name = row.get('item_name', 'Unknown')
+
+                # Log par status for each item
+                if min_par is not None and max_par is not None and min_par > 0 and max_par > 0:
+                    pars_configured += 1
+                    print(f"[PAR] ✓ '{item_name}': min={min_par}, max={max_par}")
+                else:
+                    pars_missing += 1
+                    print(f"[PAR] ⚠ '{item_name}' missing par config: min={min_par}, max={max_par}")
+
+                items.append(InventoryItem(
+                    id=row['id'],
+                    name=item_name,
+                    location=row['vendor'],
+                    adu=float(row.get('avg_consumption') or 0),
+                    unit_type=row.get('unit_type') or 'case',
+                    active=row.get('active', True),
+                    min_par=float(min_par) if min_par is not None else 0.0,
+                    max_par=float(max_par) if max_par is not None else 0.0,
+                    created_at=row.get('created_at'),
+                    updated_at=row.get('updated_at')
+                ))
+
+            print(f"[PAR] ✓ Loaded {len(items)} items from Supabase for {vendor}")
+            print(f"[PAR] Par coverage: {pars_configured} configured, {pars_missing} missing")
+            self.logger.info(f"[PAR] Loaded {len(items)} items for {vendor}, {pars_configured} with pars, {pars_missing} without")
+
+            return items
+        except Exception as e:
+            self.logger.warning(f"[PAR] Supabase read items failed: {e}")
+            print(f"[PAR] ✗ Supabase read failed: {e}, falling back to Notion")
+            return None
+
+    def _normalize_item_with_pars(self, item_row: dict) -> dict:
+        """
+        Normalize Supabase item row to include par fields.
+
+        Ensures min_par and max_par are always present with defaults.
+        Logs any items with missing par configuration.
+
+        Args:
+            item_row: Raw row from Supabase inventory_items table
+
+        Returns:
+            dict: Normalized item with guaranteed min_par/max_par fields
+        """
+        item_name = item_row.get('item_name', 'Unknown')
+        min_par = item_row.get('min_par')
+        max_par = item_row.get('max_par')
+
+        # Log warnings for unconfigured pars
+        if min_par is None or max_par is None:
+            print(f"[PAR] ⚠ Item '{item_name}' missing par config: min_par={min_par}, max_par={max_par}")
+            self.logger.warning(f"[PAR] Item '{item_name}' missing par configuration")
+
+        # Apply defaults
+        normalized = {
+            'id': item_row.get('id'),
+            'name': item_name,
+            'item_name': item_name,
+            'item_name_normalized': item_row.get('item_name_normalized', item_name.lower().strip()),
+            'vendor': item_row.get('vendor'),
+            'unit_type': item_row.get('unit_type', 'case'),
+            'unit_type_parsed': item_row.get('unit_type_parsed', {}),
+            'min_par': float(min_par) if min_par is not None else 0.0,
+            'max_par': float(max_par) if max_par is not None else 0.0,
+            'avg_consumption': float(item_row.get('avg_consumption', 0) or 0),
+            'adu': float(item_row.get('avg_consumption', 0) or 0),
+            'consumption_days': item_row.get('consumption_days'),
+            'active': item_row.get('active', True)
+        }
+
+        # Log successful normalization
+        print(f"[PAR] ✓ Normalized '{item_name}': min={normalized['min_par']:.1f}, max={normalized['max_par']:.1f}")
+
+        return normalized
+
+    # ===== SALES FORECAST FUNCTIONS =====
+
+    def get_forecast_multiplier(self, location: str, target_date: datetime = None) -> float:
+        """
+        Get sales forecast multiplier for a location/date.
+
+        The multiplier adjusts par levels:
+        - multiplier = 1.0 → use base pars
+        - multiplier = 1.2 → increase pars by 20%
+        - multiplier = 0.8 → decrease pars by 20%
+
+        Args:
+            location: Vendor/location name
+            target_date: Date to get forecast for (default: today)
+
+        Returns:
+            float: Multiplier (default 1.0 if no forecast found)
+
+        Logs: Query, result, applied multiplier
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[FORECAST] Supabase not available, using default multiplier 1.0")
+            return 1.0
+
+        if target_date is None:
+            target_date = get_time_in_timezone(BUSINESS_TIMEZONE)
+
+        # Python weekday: Monday=0, Sunday=6 (matches our schema)
+        day_of_week = target_date.weekday()
+        day_name = target_date.strftime('%A')
+
+        try:
+            print(f"[FORECAST] Getting multiplier for {location} on {day_name} (day={day_of_week})")
+
+            result = _supabase_client.table('sales_forecast') \
+                .select('baseline_sales, projected_sales, multiplier') \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .single() \
+                .execute()
+
+            if result.data:
+                multiplier = float(result.data.get('multiplier', 1.0))
+                baseline = result.data.get('baseline_sales', 0)
+                projected = result.data.get('projected_sales', 0)
+
+                print(f"[FORECAST] ✓ {location}/{day_name}: baseline=${baseline}, projected=${projected}, multiplier={multiplier:.2f}")
+                self.logger.info(f"[FORECAST] {location}/{day_name}: multiplier={multiplier:.2f}")
+
+                return multiplier
+            else:
+                print(f"[FORECAST] No forecast found for {location}/{day_name}, using 1.0")
+                return 1.0
+
+        except Exception as e:
+            print(f"[FORECAST] ✗ Error getting forecast: {e}")
+            self.logger.error(f"[FORECAST] Error: {e}")
+            return 1.0
+
+    def get_weekly_forecast(self, location: str) -> list:
+        """
+        Get full week forecast for a location.
+
+        Returns:
+            list: 7 dicts, one per day (Monday=index 0)
+
+        Logs: Query, all 7 days
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[FORECAST] Supabase not available")
+            return []
+
+        try:
+            print(f"[FORECAST] Getting weekly forecast for {location}")
+
+            result = _supabase_client.table('sales_forecast') \
+                .select('*') \
+                .eq('location', location) \
+                .order('day_of_week') \
+                .execute()
+
+            if result.data:
+                print(f"[FORECAST] ✓ Got {len(result.data)} days for {location}")
+                for row in result.data:
+                    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                    day_name = day_names[row['day_of_week']]
+                    print(f"[FORECAST]   {day_name}: ${row['projected_sales']} (×{row['multiplier']:.2f})")
+                return result.data
+
+            print(f"[FORECAST] No forecast data for {location}")
+            return []
+
+        except Exception as e:
+            print(f"[FORECAST] ✗ Error getting weekly forecast: {e}")
+            self.logger.error(f"[FORECAST] Weekly forecast error: {e}")
+            return []
+
+    def update_forecast(self, location: str, day_of_week: int, projected_sales: float, updated_by: str = None) -> bool:
+        """
+        Update sales forecast for a specific day.
+
+        Args:
+            location: Vendor/location name
+            day_of_week: 0-6 (Monday-Sunday)
+            projected_sales: Projected sales amount
+            updated_by: Who made the update
+
+        Returns:
+            bool: Success
+
+        Logs: Update attempt, result
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[FORECAST] ✗ Supabase not available")
+            return False
+
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        day_name = day_names[day_of_week] if 0 <= day_of_week <= 6 else 'Unknown'
+
+        try:
+            print(f"[FORECAST] Updating {location}/{day_name} to ${projected_sales}")
+
+            result = _supabase_client.table('sales_forecast') \
+                .update({
+                    'projected_sales': projected_sales,
+                    'updated_by': updated_by,
+                    'updated_at': datetime.now().isoformat()
+                }) \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .execute()
+
+            if result.data:
+                new_multiplier = result.data[0].get('multiplier', 1.0)
+                print(f"[FORECAST] ✓ Updated {location}/{day_name}: ${projected_sales} (×{new_multiplier:.2f})")
+                self.logger.info(f"[FORECAST] Updated {location}/{day_name}: ${projected_sales}")
+                return True
+            else:
+                print(f"[FORECAST] ✗ No rows updated for {location}/{day_name}")
+                return False
+
+        except Exception as e:
+            print(f"[FORECAST] ✗ Update failed: {e}")
+            self.logger.error(f"[FORECAST] Update error: {e}")
+            return False
+
+    def update_baseline(self, location: str, day_of_week: int, baseline_sales: float) -> bool:
+        """
+        Update baseline sales for a specific day.
+
+        Baseline is the "normal" sales level. Multiplier = projected / baseline.
+
+        Args:
+            location: Vendor/location name
+            day_of_week: 0-6 (Monday-Sunday)
+            baseline_sales: Baseline sales amount
+
+        Returns:
+            bool: Success
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        day_name = day_names[day_of_week] if 0 <= day_of_week <= 6 else 'Unknown'
+
+        try:
+            print(f"[FORECAST] Updating baseline for {location}/{day_name} to ${baseline_sales}")
+
+            result = _supabase_client.table('sales_forecast') \
+                .update({
+                    'baseline_sales': baseline_sales,
+                    'updated_at': datetime.now().isoformat()
+                }) \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .execute()
+
+            if result.data:
+                print(f"[FORECAST] ✓ Baseline updated for {location}/{day_name}")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"[FORECAST] ✗ Baseline update failed: {e}")
+            return False
+
+    # ===== END SALES FORECAST FUNCTIONS =====
+
+    # ===== DEADLINE FUNCTIONS =====
+
+    def get_deadline_for_today(self, location: str) -> dict:
+        """
+        Get deadline config for today if one exists.
+
+        Args:
+            location: Vendor/location name
+
+        Returns:
+            dict or None: Deadline config if today has a deadline
+
+        Logs: Query, result
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[DEADLINE] Supabase not available")
+            return None
+
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+        day_of_week = now.weekday()
+        day_name = now.strftime('%A')
+
+        try:
+            print(f"[DEADLINE] Checking for deadline: {location} on {day_name} (day={day_of_week})")
+
+            result = _supabase_client.table('order_deadlines') \
+                .select('*') \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .eq('active', True) \
+                .single() \
+                .execute()
+
+            if result.data:
+                deadline_hour = result.data['deadline_hour']
+                deadline_minute = result.data['deadline_minute']
+                print(f"[DEADLINE] ✓ Found deadline for {location}/{day_name}: {deadline_hour:02d}:{deadline_minute:02d}")
+                return result.data
+            else:
+                print(f"[DEADLINE] No deadline for {location} on {day_name}")
+                return None
+
+        except Exception as e:
+            # single() throws if no row found
+            if 'No rows' in str(e) or 'multiple' in str(e).lower():
+                print(f"[DEADLINE] No deadline for {location} on {day_name}")
+                return None
+            print(f"[DEADLINE] ✗ Error: {e}")
+            self.logger.error(f"[DEADLINE] Error: {e}")
+            return None
+
+    def get_all_deadlines(self, location: str = None) -> list:
+        """
+        Get all deadline configs, optionally filtered by location.
+
+        Returns:
+            list: Deadline config dicts
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return []
+
+        try:
+            query = _supabase_client.table('order_deadlines') \
+                .select('*') \
+                .eq('active', True) \
+                .order('location') \
+                .order('day_of_week')
+
+            if location:
+                query = query.eq('location', location)
+
+            result = query.execute()
+
+            if result.data:
+                print(f"[DEADLINE] ✓ Got {len(result.data)} deadline configs")
+                return result.data
+            return []
+
+        except Exception as e:
+            print(f"[DEADLINE] ✗ Error getting deadlines: {e}")
+            return []
+
+    def update_deadline(self, location: str, day_of_week: int, hour: int, minute: int = 0,
+                        reminder_minutes: int = 60, updated_by: str = None) -> bool:
+        """
+        Create or update deadline for a location/day.
+
+        Args:
+            location: Vendor name
+            day_of_week: 0-6 (Monday-Sunday)
+            hour: Deadline hour (0-23)
+            minute: Deadline minute (0-59)
+            reminder_minutes: Minutes before deadline to send reminder
+            updated_by: Who made the update
+
+        Returns:
+            bool: Success
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        day_name = day_names[day_of_week] if 0 <= day_of_week <= 6 else 'Unknown'
+
+        try:
+            print(f"[DEADLINE] Setting {location}/{day_name} deadline to {hour:02d}:{minute:02d}")
+
+            result = _supabase_client.table('order_deadlines') \
+                .upsert({
+                    'location': location,
+                    'day_of_week': day_of_week,
+                    'deadline_hour': hour,
+                    'deadline_minute': minute,
+                    'reminder_minutes_before': reminder_minutes,
+                    'active': True,
+                    'updated_by': updated_by,
+                    'updated_at': datetime.now().isoformat()
+                }, on_conflict='location,day_of_week') \
+                .execute()
+
+            if result.data:
+                print(f"[DEADLINE] ✓ Deadline set: {location}/{day_name} at {hour:02d}:{minute:02d}")
+                self.logger.info(f"[DEADLINE] Set {location}/{day_name} to {hour:02d}:{minute:02d}")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"[DEADLINE] ✗ Update failed: {e}")
+            self.logger.error(f"[DEADLINE] Update error: {e}")
+            return False
+
+    def set_deadline_chat_ids(self, location: str, day_of_week: int,
+                              notification_chat_id: int = None,
+                              escalation_chat_id: int = None) -> bool:
+        """
+        Set notification chat IDs for a deadline.
+
+        Args:
+            location: Vendor name
+            day_of_week: 0-6
+            notification_chat_id: Chat for team reminders
+            escalation_chat_id: Chat for escalations (admin DM)
+
+        Returns:
+            bool: Success
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        try:
+            update_data = {'updated_at': datetime.now().isoformat()}
+
+            if notification_chat_id is not None:
+                update_data['notification_chat_id'] = notification_chat_id
+            if escalation_chat_id is not None:
+                update_data['escalation_chat_id'] = escalation_chat_id
+
+            result = _supabase_client.table('order_deadlines') \
+                .update(update_data) \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .execute()
+
+            if result.data:
+                print(f"[DEADLINE] ✓ Chat IDs updated for {location}/day={day_of_week}")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"[DEADLINE] ✗ Chat ID update failed: {e}")
+            return False
+
+    def log_deadline_event(self, location: str, event_type: str,
+                           submitted_by: str = None, notes: str = None) -> bool:
+        """
+        Log a deadline event for compliance tracking.
+
+        Args:
+            location: Vendor name
+            event_type: 'reminder_sent', 'deadline_missed', 'order_submitted', 'escalation_sent'
+            submitted_by: Who submitted (for order_submitted events)
+            notes: Additional context
+
+        Returns:
+            bool: Success
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+
+        try:
+            result = _supabase_client.table('deadline_events') \
+                .insert({
+                    'location': location,
+                    'deadline_date': now.date().isoformat(),
+                    'deadline_time': now.time().isoformat(),
+                    'event_type': event_type,
+                    'submitted_by': submitted_by,
+                    'submitted_at': now.isoformat() if submitted_by else None,
+                    'notes': notes
+                }) \
+                .execute()
+
+            if result.data:
+                print(f"[DEADLINE] ✓ Logged event: {location} - {event_type}")
+                self.logger.info(f"[DEADLINE] Event logged: {location}/{event_type}")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"[DEADLINE] ✗ Event log failed: {e}")
+            return False
+
+    def check_order_submitted_today(self, location: str) -> bool:
+        """
+        Check if an order was submitted for this location today.
+
+        Returns:
+            bool: True if order was submitted
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        today = get_time_in_timezone(BUSINESS_TIMEZONE).date()
+
+        try:
+            result = _supabase_client.table('inventory_transactions') \
+                .select('id') \
+                .eq('vendor', location) \
+                .eq('type', 'order') \
+                .gte('created_at', today.isoformat()) \
+                .limit(1) \
+                .execute()
+
+            submitted = bool(result.data)
+            print(f"[DEADLINE] Order check for {location} on {today}: {'✓ Submitted' if submitted else '✗ Not submitted'}")
+            return submitted
+
+        except Exception as e:
+            print(f"[DEADLINE] ✗ Order check failed: {e}")
+            return False
+
+    # ===== END DEADLINE FUNCTIONS =====
+
+    # ===== COUNT SCHEDULE FUNCTIONS =====
+
+    def get_count_schedule_for_today(self, location: str) -> dict:
+        """
+        Get count schedule for today if one exists.
+
+        Args:
+            location: Vendor/location name
+
+        Returns:
+            dict or None: Schedule config if today has a count due
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return None
+
+        now = get_time_in_timezone(BUSINESS_TIMEZONE)
+        day_of_week = now.weekday()
+        day_name = now.strftime('%A')
+
+        try:
+            print(f"[COUNT] Checking for count schedule: {location} on {day_name}")
+
+            result = _supabase_client.table('count_schedules') \
+                .select('*') \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .eq('active', True) \
+                .single() \
+                .execute()
+
+            if result.data:
+                due_hour = result.data['due_hour']
+                due_minute = result.data['due_minute']
+                print(f"[COUNT] ✓ Found schedule for {location}/{day_name}: {due_hour:02d}:{due_minute:02d}")
+                return result.data
+            else:
+                print(f"[COUNT] No schedule for {location} on {day_name}")
+                return None
+
+        except Exception as e:
+            if 'No rows' in str(e) or 'multiple' in str(e).lower():
+                print(f"[COUNT] No schedule for {location} on {day_name}")
+                return None
+            print(f"[COUNT] ✗ Error: {e}")
+            return None
+
+    def get_all_count_schedules(self, location: str = None) -> list:
+        """
+        Get all count schedule configs, optionally filtered by location.
+
+        Returns:
+            list: Schedule config dicts
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return []
+
+        try:
+            query = _supabase_client.table('count_schedules') \
+                .select('*') \
+                .eq('active', True) \
+                .order('location') \
+                .order('day_of_week')
+
+            if location:
+                query = query.eq('location', location)
+
+            result = query.execute()
+
+            if result.data:
+                print(f"[COUNT] ✓ Got {len(result.data)} count schedules")
+                return result.data
+            return []
+
+        except Exception as e:
+            print(f"[COUNT] ✗ Error getting schedules: {e}")
+            return []
+
+    def update_count_schedule(self, location: str, day_of_week: int, hour: int, minute: int = 0,
+                              reminder_minutes: int = 60, updated_by: str = None) -> bool:
+        """
+        Create or update count schedule for a location/day.
+
+        Args:
+            location: Vendor name
+            day_of_week: 0-6 (Monday-Sunday)
+            hour: Due hour (0-23)
+            minute: Due minute (0-59)
+            reminder_minutes: Minutes before to send reminder
+            updated_by: Who made the update
+
+        Returns:
+            bool: Success
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        day_name = day_names[day_of_week] if 0 <= day_of_week <= 6 else 'Unknown'
+
+        try:
+            print(f"[COUNT] Setting {location}/{day_name} count due at {hour:02d}:{minute:02d}")
+
+            result = _supabase_client.table('count_schedules') \
+                .upsert({
+                    'location': location,
+                    'day_of_week': day_of_week,
+                    'due_hour': hour,
+                    'due_minute': minute,
+                    'reminder_minutes_before': reminder_minutes,
+                    'active': True,
+                    'updated_by': updated_by,
+                    'updated_at': datetime.now().isoformat()
+                }, on_conflict='location,day_of_week') \
+                .execute()
+
+            if result.data:
+                print(f"[COUNT] ✓ Schedule set: {location}/{day_name} at {hour:02d}:{minute:02d}")
+                self.logger.info(f"[COUNT] Set {location}/{day_name} to {hour:02d}:{minute:02d}")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"[COUNT] ✗ Update failed: {e}")
+            self.logger.error(f"[COUNT] Update error: {e}")
+            return False
+
+    def set_count_schedule_chat_ids(self, location: str, day_of_week: int,
+                                     notification_chat_id: int = None,
+                                     escalation_chat_id: int = None) -> bool:
+        """Set notification chat IDs for a count schedule."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        try:
+            update_data = {'updated_at': datetime.now().isoformat()}
+
+            if notification_chat_id is not None:
+                update_data['notification_chat_id'] = notification_chat_id
+            if escalation_chat_id is not None:
+                update_data['escalation_chat_id'] = escalation_chat_id
+
+            result = _supabase_client.table('count_schedules') \
+                .update(update_data) \
+                .eq('location', location) \
+                .eq('day_of_week', day_of_week) \
+                .execute()
+
+            if result.data:
+                print(f"[COUNT] ✓ Chat IDs updated for {location}/day={day_of_week}")
+                return True
+            return False
+
+        except Exception as e:
+            print(f"[COUNT] ✗ Chat ID update failed: {e}")
+            return False
+
+    def check_count_submitted_today(self, location: str) -> bool:
+        """
+        Check if an on_hand count was submitted for this location today.
+
+        Returns:
+            bool: True if count was submitted
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return False
+
+        today = get_time_in_timezone(BUSINESS_TIMEZONE).date()
+
+        try:
+            result = _supabase_client.table('inventory_transactions') \
+                .select('id') \
+                .eq('vendor', location) \
+                .eq('type', 'on_hand') \
+                .eq('date', today.isoformat()) \
+                .limit(1) \
+                .execute()
+
+            submitted = bool(result.data)
+            print(f"[COUNT] Count check for {location} on {today}: {'✓ Submitted' if submitted else '✗ Not submitted'}")
+            return submitted
+
+        except Exception as e:
+            print(f"[COUNT] ✗ Count check failed: {e}")
+            return False
+
+    def log_count_event(self, location: str, event_type: str, notes: str = None) -> bool:
+        """Log a count-related event to deadline_events table."""
+        return self.log_deadline_event(location, event_type, notes=notes)
+
+    # ===== END COUNT SCHEDULE FUNCTIONS =====
+
+    # ===== CONSUMPTION CYCLE FUNCTIONS =====
+
+    def start_consumption_cycle(self, location: str, item_name: str,
+                                on_hand: float, received: float = 0) -> str:
+        """
+        Start a new consumption cycle when delivery is received.
+
+        Args:
+            location: Vendor name
+            item_name: Item name
+            on_hand: On-hand quantity at cycle start
+            received: Quantity received in this delivery
+
+        Returns:
+            str: Cycle ID or None if failed
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[CYCLE] Supabase not available")
+            return None
+
+        today = get_time_in_timezone(BUSINESS_TIMEZONE).date()
+
+        try:
+            # Close any existing open cycle for this item
+            self._close_open_cycles(location, item_name, on_hand)
+
+            # Create new cycle
+            print(f"[CYCLE] Starting cycle: {location}/{item_name} - OH={on_hand}, received={received}")
+
+            result = _supabase_client.table('consumption_cycles') \
+                .insert({
+                    'location': location,
+                    'item_name': item_name,
+                    'cycle_start_date': today.isoformat(),
+                    'start_on_hand': on_hand,
+                    'received_qty': received,
+                    'status': 'open'
+                }) \
+                .execute()
+
+            if result.data:
+                cycle_id = result.data[0]['id']
+                print(f"[CYCLE] ✓ Started cycle {cycle_id[:8]} for {item_name}")
+                self.logger.info(f"[CYCLE] Started: {location}/{item_name} cycle={cycle_id[:8]}")
+                return cycle_id
+
+            return None
+
+        except Exception as e:
+            # Handle unique constraint (cycle already exists for today)
+            if 'duplicate' in str(e).lower() or 'unique' in str(e).lower():
+                print(f"[CYCLE] Cycle already exists for {item_name} today")
+                return 'exists'
+
+            print(f"[CYCLE] ✗ Failed to start cycle: {e}")
+            self.logger.error(f"[CYCLE] Start error: {e}")
+            return None
+
+    def _close_open_cycles(self, location: str, item_name: str, end_on_hand: float):
+        """
+        Close any open cycles for an item and calculate consumption.
+
+        Called when a new delivery arrives (which starts a new cycle).
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return
+
+        today = get_time_in_timezone(BUSINESS_TIMEZONE).date()
+
+        try:
+            # Find open cycles
+            result = _supabase_client.table('consumption_cycles') \
+                .select('*') \
+                .eq('location', location) \
+                .eq('item_name', item_name) \
+                .eq('status', 'open') \
+                .execute()
+
+            if not result.data:
+                return
+
+            for cycle in result.data:
+                cycle_id = cycle['id']
+                start_date = datetime.fromisoformat(cycle['cycle_start_date']).date()
+                start_on_hand = float(cycle.get('start_on_hand', 0) or 0)
+                received = float(cycle.get('received_qty', 0) or 0)
+
+                # Calculate days in cycle
+                days_in_cycle = (today - start_date).days
+                if days_in_cycle <= 0:
+                    print(f"[CYCLE] Skipping same-day cycle close for {item_name}")
+                    continue
+
+                # Calculate actual consumption
+                actual_consumption = start_on_hand + received - end_on_hand
+
+                # Get expected consumption from item's avg_consumption
+                item_result = _supabase_client.table('inventory_items') \
+                    .select('avg_consumption') \
+                    .eq('vendor', location) \
+                    .eq('item_name', item_name) \
+                    .limit(1) \
+                    .execute()
+
+                avg_consumption = 0
+                if item_result.data:
+                    avg_consumption = float(item_result.data[0].get('avg_consumption', 0) or 0)
+
+                expected_consumption = avg_consumption * days_in_cycle
+
+                # Calculate drift
+                if expected_consumption > 0:
+                    drift = abs(actual_consumption - expected_consumption) / expected_consumption * 100
+                else:
+                    drift = 0 if actual_consumption == 0 else 100
+
+                print(f"[CYCLE] Closing cycle for {item_name}:")
+                print(f"[CYCLE]   Days: {days_in_cycle}")
+                print(f"[CYCLE]   Start OH: {start_on_hand}, Received: {received}, End OH: {end_on_hand}")
+                print(f"[CYCLE]   Actual consumption: {actual_consumption:.1f}")
+                print(f"[CYCLE]   Expected consumption: {expected_consumption:.1f}")
+                print(f"[CYCLE]   Drift: {drift:.1f}%")
+
+                # Determine status
+                if drift > 50:
+                    status = 'flagged'
+                    print(f"[CYCLE] ⚠ FLAGGED: {drift:.1f}% drift exceeds 50% threshold")
+                else:
+                    status = 'closed'
+
+                # Update cycle record
+                _supabase_client.table('consumption_cycles') \
+                    .update({
+                        'cycle_end_date': today.isoformat(),
+                        'days_in_cycle': days_in_cycle,
+                        'end_on_hand': end_on_hand,
+                        'actual_consumption': actual_consumption,
+                        'expected_consumption': expected_consumption,
+                        'drift_percentage': drift,
+                        'status': status,
+                        'updated_at': datetime.now().isoformat()
+                    }) \
+                    .eq('id', cycle_id) \
+                    .execute()
+
+                print(f"[CYCLE] ✓ Closed cycle {cycle_id[:8]} with status: {status}")
+                self.logger.info(f"[CYCLE] Closed: {item_name} drift={drift:.1f}% status={status}")
+
+                # Trigger calibration check
+                self._check_calibration_needed(location, item_name)
+
+        except Exception as e:
+            print(f"[CYCLE] ✗ Error closing cycles: {e}")
+            self.logger.error(f"[CYCLE] Close error: {e}")
+
+    def _check_calibration_needed(self, location: str, item_name: str):
+        """
+        Check if par adjustment is needed based on recent cycles.
+
+        Rule: If drift > 25% for 2 consecutive cycles, auto-adjust.
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return
+
+        try:
+            # Get last 2 closed cycles
+            result = _supabase_client.table('consumption_cycles') \
+                .select('*') \
+                .eq('location', location) \
+                .eq('item_name', item_name) \
+                .eq('status', 'closed') \
+                .order('cycle_end_date', desc=True) \
+                .limit(2) \
+                .execute()
+
+            if not result.data or len(result.data) < 2:
+                print(f"[CALIBRATE] Not enough cycles for {item_name} (need 2)")
+                return
+
+            cycles = result.data
+
+            # Check if both have >25% drift in same direction
+            drift1 = float(cycles[0].get('drift_percentage', 0) or 0)
+            drift2 = float(cycles[1].get('drift_percentage', 0) or 0)
+
+            actual1 = float(cycles[0].get('actual_consumption', 0) or 0)
+            expected1 = float(cycles[0].get('expected_consumption', 0) or 0)
+            actual2 = float(cycles[1].get('actual_consumption', 0) or 0)
+            expected2 = float(cycles[1].get('expected_consumption', 0) or 0)
+
+            # Check drift threshold
+            if drift1 < 25 or drift2 < 25:
+                print(f"[CALIBRATE] Drift below threshold for {item_name}: {drift1:.1f}%, {drift2:.1f}%")
+                return
+
+            # Check same direction (both over or both under)
+            over1 = actual1 > expected1
+            over2 = actual2 > expected2
+
+            if over1 != over2:
+                print(f"[CALIBRATE] Drift direction inconsistent for {item_name}, skipping")
+                return
+
+            # Calculate new avg_consumption based on recent actuals
+            days1 = int(cycles[0].get('days_in_cycle', 0) or 0)
+            days2 = int(cycles[1].get('days_in_cycle', 0) or 0)
+            total_days = days1 + days2
+            total_consumption = actual1 + actual2
+
+            if total_days <= 0:
+                return
+
+            new_avg_consumption = total_consumption / total_days
+
+            print(f"[CALIBRATE] ✓ Auto-calibration triggered for {item_name}")
+            print(f"[CALIBRATE]   Consecutive drifts: {drift1:.1f}%, {drift2:.1f}%")
+            print(f"[CALIBRATE]   Direction: {'OVER' if over1 else 'UNDER'} consumption")
+            print(f"[CALIBRATE]   New avg_consumption: {new_avg_consumption:.2f}")
+
+            # Apply calibration
+            self._apply_par_calibration(location, item_name, new_avg_consumption,
+                                        f"Auto-calibrated after {drift1:.0f}%/{drift2:.0f}% drift")
+
+            # Mark cycles as adjusted
+            for cycle in cycles:
+                _supabase_client.table('consumption_cycles') \
+                    .update({
+                        'adjustment_applied': True,
+                        'status': 'adjusted'
+                    }) \
+                    .eq('id', cycle['id']) \
+                    .execute()
+
+        except Exception as e:
+            print(f"[CALIBRATE] ✗ Error checking calibration: {e}")
+            self.logger.error(f"[CALIBRATE] Error: {e}")
+
+    def _apply_par_calibration(self, location: str, item_name: str,
+                               new_avg_consumption: float, reason: str):
+        """
+        Apply par calibration by updating avg_consumption and adjusting pars.
+
+        Par adjustment: Scale pars proportionally to consumption change.
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return
+
+        try:
+            # Get current item values
+            item_result = _supabase_client.table('inventory_items') \
+                .select('id, avg_consumption, min_par, max_par') \
+                .eq('vendor', location) \
+                .eq('item_name', item_name) \
+                .limit(1) \
+                .execute()
+
+            if not item_result.data:
+                print(f"[CALIBRATE] ✗ Item not found: {item_name}")
+                return
+
+            item = item_result.data[0]
+            item_id = item['id']
+            old_avg = float(item.get('avg_consumption', 0) or 0)
+            old_min = float(item.get('min_par', 0) or 0)
+            old_max = float(item.get('max_par', 0) or 0)
+
+            # Calculate scaling factor
+            if old_avg > 0:
+                scale_factor = new_avg_consumption / old_avg
+            else:
+                scale_factor = 1.0
+
+            # Calculate new pars (scale proportionally)
+            new_min = old_min * scale_factor
+            new_max = old_max * scale_factor
+
+            print(f"[CALIBRATE] Applying calibration to {item_name}:")
+            print(f"[CALIBRATE]   avg_consumption: {old_avg:.2f} → {new_avg_consumption:.2f}")
+            print(f"[CALIBRATE]   min_par: {old_min:.1f} → {new_min:.1f}")
+            print(f"[CALIBRATE]   max_par: {old_max:.1f} → {new_max:.1f}")
+            print(f"[CALIBRATE]   Scale factor: {scale_factor:.2f}")
+
+            # Update item
+            _supabase_client.table('inventory_items') \
+                .update({
+                    'avg_consumption': new_avg_consumption,
+                    'min_par': new_min,
+                    'max_par': new_max,
+                    'last_par_update': datetime.now().isoformat()
+                }) \
+                .eq('id', item_id) \
+                .execute()
+
+            # Log to par_history
+            _supabase_client.table('par_history') \
+                .insert({
+                    'item_id': item_id,
+                    'old_min_par': old_min,
+                    'old_max_par': old_max,
+                    'new_min_par': new_min,
+                    'new_max_par': new_max,
+                    'actual_consumption': new_avg_consumption,
+                    'reason': reason
+                }) \
+                .execute()
+
+            print(f"[CALIBRATE] ✓ Calibration applied to {item_name}")
+            self.logger.info(f"[CALIBRATE] Applied: {item_name} avg={new_avg_consumption:.2f} min={new_min:.1f} max={new_max:.1f}")
+
+        except Exception as e:
+            print(f"[CALIBRATE] ✗ Failed to apply calibration: {e}")
+            self.logger.error(f"[CALIBRATE] Apply error: {e}")
+
+    def get_flagged_cycles(self, location: str = None) -> list:
+        """
+        Get cycles flagged for manual review (>50% drift).
+
+        Returns:
+            list: Flagged cycle records
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return []
+
+        try:
+            query = _supabase_client.table('consumption_cycles') \
+                .select('*') \
+                .eq('status', 'flagged') \
+                .order('updated_at', desc=True)
+
+            if location:
+                query = query.eq('location', location)
+
+            result = query.execute()
+
+            if result.data:
+                print(f"[CYCLE] ✓ Found {len(result.data)} flagged cycles")
+                return result.data
+
+            return []
+
+        except Exception as e:
+            print(f"[CYCLE] ✗ Error getting flagged cycles: {e}")
+            return []
+
+    def get_latest_inventory(self, vendor: str, entry_type: str = 'on_hand') -> dict:
+        """
+        Get the latest inventory quantities for a vendor.
+
+        Returns:
+            dict: {item_name: quantity}
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return {}
+
+        try:
+            result = _supabase_client.table('inventory_transactions') \
+                .select('quantities') \
+                .eq('vendor', vendor) \
+                .eq('type', entry_type) \
+                .order('date', desc=True) \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+
+            if result.data:
+                quantities = result.data[0].get('quantities', {})
+                if isinstance(quantities, str):
+                    import json
+                    quantities = json.loads(quantities)
+                return quantities
+
+            return {}
+
+        except Exception as e:
+            print(f"[INVENTORY] ✗ Error getting latest inventory: {e}")
+            return {}
+
+    # ===== END CONSUMPTION CYCLE FUNCTIONS =====
+
+    def _read_inventory_from_supabase(self, vendor: str, entry_type: str = 'on_hand'):
+        """Read latest inventory from Supabase. Returns dict or None to fallback."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return None
+
+        try:
+            result = _supabase_client.table('inventory_transactions') \
+                .select('quantities') \
+                .eq('vendor', vendor) \
+                .eq('type', entry_type) \
+                .order('date', desc=True) \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+
+            if result.data:
+                quantities = result.data[0].get('quantities', {})
+                print(f"[PHASE 2] ✓ Read inventory from Supabase for {vendor}/{entry_type}")
+                return quantities
+            print(f"[PHASE 2] ✓ No inventory data in Supabase for {vendor}/{entry_type}")
+            return {}
+        except Exception as e:
+            self.logger.warning(f"Supabase read inventory failed: {e}")
+            print(f"[PHASE 2] ⚠ Supabase read inventory failed: {e}, falling back to Notion")
+            return None
+
+    def _read_locations_from_supabase(self):
+        """Read vendor list from Supabase. Returns list or None to fallback."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return None
+
+        try:
+            result = _supabase_client.table('inventory_items') \
+                .select('vendor') \
+                .eq('active', True) \
+                .execute()
+
+            vendors = sorted(set(r['vendor'] for r in result.data if r.get('vendor')))
+            print(f"[PHASE 2] ✓ Read {len(vendors)} locations from Supabase")
+            return vendors
+        except Exception as e:
+            self.logger.warning(f"Supabase read locations failed: {e}")
+            print(f"[PHASE 2] ⚠ Supabase read locations failed: {e}, falling back to Notion")
+            return None
+
+    def calculate_expected_count(self, item_name: str, vendor: str) -> dict:
+        """
+        Calculate expected count with fallbacks and confidence level.
+
+        Priority:
+        1. last_onhand + deliveries - consumption (HIGH confidence)
+        2. par_level (MEDIUM confidence)
+        3. last_known_value (LOW confidence)
+        4. None (NO_DATA)
+
+        Returns:
+            dict: {
+                'expected': float or None,
+                'confidence': 'HIGH' | 'MEDIUM' | 'LOW' | 'NO_DATA',
+                'source': str describing data source
+            }
+        """
+        if not _supabase_enabled:
+            self.logger.debug(f"[PHASE 1] Expected calc skipped - Supabase not enabled")
+            return {'expected': None, 'confidence': 'NO_DATA', 'source': 'Supabase disabled'}
+
+        try:
+            # Attempt 1: Full calculation from transaction history
+            # Schema: quantities is JSON {item_name: qty}, type is 'on_hand'/'received', date is 'YYYY-MM-DD'
+            last = _supabase_client.table('inventory_transactions') \
+                .select('quantities, date') \
+                .eq('vendor', vendor) \
+                .eq('type', 'on_hand') \
+                .order('date', desc=True) \
+                .order('created_at', desc=True) \
+                .limit(1) \
+                .execute()
+
+            # Check if we have data AND the item exists in the quantities JSON
+            if last.data and item_name in (last.data[0].get('quantities') or {}):
+                last_qty = float(last.data[0]['quantities'].get(item_name, 0) or 0)
+                last_date = last.data[0]['date']
+
+                # Get deliveries since last count
+                deliveries = _supabase_client.table('inventory_transactions') \
+                    .select('quantities') \
+                    .eq('vendor', vendor) \
+                    .eq('type', 'received') \
+                    .gt('date', last_date) \
+                    .execute()
+
+                delivered = sum(
+                    float(d['quantities'].get(item_name, 0) or 0)
+                    for d in (deliveries.data or [])
+                    if d.get('quantities')
+                )
+
+                # Get ADU from inventory_items
+                item = _supabase_client.table('inventory_items') \
+                    .select('avg_consumption') \
+                    .eq('vendor', vendor) \
+                    .eq('item_name', item_name) \
+                    .limit(1) \
+                    .execute()
+
+                adu = float(item.data[0].get('avg_consumption', 0) or 0) if item.data else 0
+
+                # Calculate days since last count
+                from datetime import datetime
+                last_dt = datetime.strptime(last_date, '%Y-%m-%d')
+                days = max(1, (datetime.now() - last_dt).days)
+
+                expected = max(0, last_qty + delivered - (adu * days))
+
+                self.logger.debug(f"[PHASE 1] Expected calc: {item_name} = {last_qty} + {delivered} - ({adu} * {days}) = {expected:.1f}")
+                print(f"[PHASE 1] Expected count for {item_name}: {expected:.1f} (HIGH confidence)")
+
+                return {
+                    'expected': round(expected, 1),
+                    'confidence': 'HIGH',
+                    'source': f'last={last_qty}, delivered={delivered}, consumed={adu*days:.1f}'
+                }
+
+            # Attempt 2: Fallback to par_level
+            item = _supabase_client.table('inventory_items') \
+                .select('min_par, max_par, last_known_value') \
+                .eq('vendor', vendor) \
+                .eq('item_name', item_name) \
+                .single() \
+                .execute()
+
+            if item.data:
+                min_par = item.data.get('min_par', 0)
+                max_par = item.data.get('max_par', 0)
+                last_known = item.data.get('last_known_value')
+
+                # Use midpoint of par range as expected
+                if min_par > 0 or max_par > 0:
+                    par_expected = (min_par + max_par) / 2 if max_par > 0 else min_par
+                    self.logger.info(f"[PHASE 1] Using par_level fallback for {item_name}: {par_expected}")
+                    print(f"[PHASE 1] Expected count for {item_name}: {par_expected:.1f} (MEDIUM confidence - par)")
+
+                    return {
+                        'expected': round(par_expected, 1),
+                        'confidence': 'MEDIUM',
+                        'source': f'par_level midpoint (min={min_par}, max={max_par})'
+                    }
+
+                # Attempt 3: Fallback to last_known_value
+                if last_known is not None:
+                    self.logger.info(f"[PHASE 1] Using last_known_value fallback for {item_name}: {last_known}")
+                    print(f"[PHASE 1] Expected count for {item_name}: {last_known:.1f} (LOW confidence)")
+
+                    return {
+                        'expected': round(last_known, 1),
+                        'confidence': 'LOW',
+                        'source': 'last_known_value'
+                    }
+
+            # No data available
+            self.logger.debug(f"[PHASE 1] No baseline data for {item_name} at {vendor}")
+            return {'expected': None, 'confidence': 'NO_DATA', 'source': 'No baseline data'}
+
+        except Exception as e:
+            self.logger.warning(f"[PHASE 1] Expected count calc failed: {e}")
+            return {'expected': None, 'confidence': 'NO_DATA', 'source': f'Error: {e}'}
+
+    def get_variance_threshold(self, vendor: str, item_name: str = None) -> float:
+        """
+        Get variance threshold from baseline_expectations table.
+
+        Priority:
+        1. Item-specific threshold for vendor
+        2. Vendor-wide threshold (item_name = '*')
+        3. Default 0.20 (20%)
+
+        Args:
+            vendor: Vendor/location name
+            item_name: Optional specific item name
+
+        Returns:
+            float: Threshold value (e.g., 0.20 for 20%)
+        """
+        DEFAULT_THRESHOLD = 0.20
+
+        if not _supabase_enabled:
+            return DEFAULT_THRESHOLD
+
+        try:
+            # Try item-specific threshold first
+            if item_name:
+                result = _supabase_client.table('baseline_expectations') \
+                    .select('variance_threshold') \
+                    .eq('vendor', vendor) \
+                    .eq('item_name', item_name) \
+                    .limit(1) \
+                    .execute()
+
+                if result.data and result.data[0].get('variance_threshold') is not None:
+                    threshold = result.data[0]['variance_threshold']
+                    self.logger.debug(f"[PHASE 2] Item threshold for {item_name}: {threshold}")
+                    return threshold
+
+            # Try vendor-wide threshold
+            result = _supabase_client.table('baseline_expectations') \
+                .select('variance_threshold') \
+                .eq('vendor', vendor) \
+                .eq('item_name', '*') \
+                .limit(1) \
+                .execute()
+
+            if result.data and result.data[0].get('variance_threshold') is not None:
+                threshold = result.data[0]['variance_threshold']
+                self.logger.debug(f"[PHASE 2] Vendor threshold for {vendor}: {threshold}")
+                return threshold
+
+            self.logger.debug(f"[PHASE 2] Using default threshold: {DEFAULT_THRESHOLD}")
+            return DEFAULT_THRESHOLD
+
+        except Exception as e:
+            self.logger.warning(f"[PHASE 2] Failed to get threshold: {e}")
+            return DEFAULT_THRESHOLD
+
+    def check_variance(self, item_name: str, vendor: str, actual: float, threshold: float = None) -> dict:
+        """
+        Check if count has suspicious variance.
+
+        Args:
+            item_name: Name of item
+            vendor: Vendor/location
+            actual: Actual counted value
+            threshold: Override threshold (None = fetch from DB)
+
+        Returns:
+            {'expected': float, 'variance': float, 'suspicious': bool, 'message': str, 'confidence': str, 'threshold': float}
+        """
+        # Get threshold from DB if not provided
+        if threshold is None:
+            threshold = self.get_variance_threshold(vendor, item_name)
+
+        result = self.calculate_expected_count(item_name, vendor)
+        expected = result.get('expected')
+        confidence = result.get('confidence', 'NO_DATA')
+
+        if expected is None:
+            self.logger.debug(f"[PHASE 4] Variance check skipped for {item_name} - no baseline")
+            return {
+                'expected': None,
+                'variance': 0,
+                'suspicious': False,
+                'message': 'No baseline',
+                'confidence': confidence,
+                'threshold': threshold
+            }
+
+        variance = abs(actual - expected) / expected if expected > 0 else 0
+        suspicious = variance > threshold
+
+        direction = "higher" if actual > expected else "lower"
+        message = f"{variance:.0%} {direction} than expected (~{expected:.1f})" if suspicious else "OK"
+
+        self.logger.info(f"[PHASE 4] Variance check: {item_name} actual={actual} expected={expected:.1f} variance={variance:.0%} threshold={threshold:.0%} suspicious={suspicious}")
+
+        if suspicious:
+            print(f"[PHASE 4] VARIANCE DETECTED: {item_name} - {message} (threshold: {threshold:.0%})")
+
+        return {
+            'expected': expected,
+            'variance': round(variance, 2),
+            'suspicious': suspicious,
+            'message': message,
+            'confidence': confidence,
+            'threshold': threshold
+        }
+
+    def get_managers_for_location(self, location: str = None) -> list:
+        """
+        Get manager telegram_ids for notifications.
+
+        Args:
+            location: Optional location filter (reserved for future use)
+
+        Returns:
+            list: [{'telegram_id': int, 'name': str}, ...]
+        """
+        if not _supabase_enabled:
+            return []
+
+        try:
+            # Get all active managers (telegram_users has no location column)
+            result = _supabase_client.table('telegram_users') \
+                .select('telegram_id, name') \
+                .eq('role', 'manager') \
+                .eq('active', True) \
+                .execute()
+
+            managers = result.data or []
+            self.logger.info(f"[PHASE 4] Found {len(managers)} managers")
+            return managers
+
+        except Exception as e:
+            self.logger.error(f"[PHASE 4] Failed to get managers: {e}")
+            return []
+
     def _initialize_system(self):
         """
         Initialize the complete system with schema validation and data seeding.
@@ -987,8 +3562,15 @@ class NotionManager:
         Returns:
             List[InventoryItem]: List of inventory items for location
         """
+        # === SUPABASE FIRST (Phase 2) ===
+        supabase_result = self._read_items_from_supabase(location)
+        if supabase_result is not None:
+            self.logger.info(f"[PHASE 2] Using Supabase for get_items_for_location({location})")
+            return supabase_result
+        # === FALLBACK TO NOTION ===
+
         cache_key = f"items_{location}"
-        
+
         # Check cache first
         if use_cache and self._is_cache_valid() and cache_key in self._items_cache:
             self.logger.debug(f"Using cached items for {location}")
@@ -1049,18 +3631,21 @@ class NotionManager:
     # ===== SHORTAGE TRACKING ENHANCEMENTS =====
 
     # Add this method to the NotionManager class
-    def save_order_transaction(self, location: str, date: str, manager: str, 
-                            notes: str, quantities: Dict[str, float]) -> bool:
+    def save_order_transaction(self, location: str, date: str, manager: str,
+                            notes: str, quantities: Dict[str, float],
+                            flagged: bool = False, flag_reason: Optional[str] = None) -> bool:
         """
         Save order transaction to track what was ordered.
-        
+
         Args:
             location: Location name
             date: Date in YYYY-MM-DD format
             manager: Manager name (becomes page title)
             notes: Optional notes
             quantities: Dict mapping item names to ordered quantities
-            
+            flagged: Whether order has flagged items (Phase 5)
+            flag_reason: Reason for flagging (Phase 5)
+
         Returns:
             bool: True if successful
         """
@@ -1138,18 +3723,45 @@ class NotionManager:
                 ]
             }
             
-            # Create the page
-            page_data = {
-                'parent': {
-                    'database_id': self.inventory_db_id
-                },
-                'properties': properties
-            }
-            
-            response = self._make_request('POST', '/pages', page_data)
-            
+            # === PHASE 3: CONDITIONAL NOTION WRITES ===
+            NOTION_WRITES_ENABLED = os.environ.get('NOTION_WRITES_ENABLED', 'true').lower() == 'true'
+
+            if NOTION_WRITES_ENABLED:
+                # Create the page
+                page_data = {
+                    'parent': {
+                        'database_id': self.inventory_db_id
+                    },
+                    'properties': properties
+                }
+
+                response = self._make_request('POST', '/pages', page_data)
+                print(f"[PHASE 3] Notion write ENABLED for order transaction")
+            else:
+                response = {'id': 'supabase-only'}  # Fake success for flow
+                print(f"[PHASE 3] Notion write DISABLED - Supabase only for order transaction")
+            # === END PHASE 3 ===
+
             if response:
                 self.logger.info(f"Saved order transaction: {title}")
+
+                # === DUAL-WRITE TO SUPABASE ===
+                print(f"[PHASE 1] Attempting dual-write for order transaction: {location}")
+                # === PHASE 5: Pass flag parameters ===
+                self._write_to_supabase('inventory_transactions', {
+                    'date': date,
+                    'vendor': location,
+                    'type': 'order',
+                    'quantities': quantities,
+                    'submitter': manager,
+                    'notes': notes if notes else None,
+                    'leader': None,
+                    'photo_url': None,
+                    'flagged': flagged,
+                    'flag_reason': flag_reason
+                })
+                # === END DUAL-WRITE ===
+
                 return True
             else:
                 self.logger.error(f"Failed to save order transaction")
@@ -1390,9 +4002,16 @@ class NotionManager:
             
         Logs: cache hit/miss, query execution, location count, cache update
         """
+        # === SUPABASE FIRST (Phase 2) ===
+        supabase_result = self._read_locations_from_supabase()
+        if supabase_result is not None:
+            self.logger.info(f"[PHASE 2] Using Supabase for get_locations()")
+            return supabase_result
+        # === FALLBACK TO NOTION ===
+
         cache_key = "_locations_list"
         cache_ttl = 300  # 5 minutes
-        
+
         # Check cache first
         if use_cache and hasattr(self, '_locations_cache_timestamp'):
             cache_age = time.time() - self._locations_cache_timestamp
@@ -1482,12 +4101,14 @@ class NotionManager:
                 self.logger.warning(f"Returning stale cached locations due to error | count={len(cached)}")
             return cached
     
-    def save_inventory_transaction(self, location: str, entry_type: str, date: str, 
+    def save_inventory_transaction(self, location: str, entry_type: str, date: str,
                                 manager: str, notes: str, quantities: Dict[str, float],
-                                image_file_id: Optional[str] = None) -> bool:
+                                image_file_id: Optional[str] = None,
+                                flagged: bool = False, flag_reason: Optional[str] = None,
+                                photo_url: Optional[str] = None) -> bool:
         """
         Save inventory transaction with optional image using Telegram file approach.
-        
+
         Args:
             location: Location name
             entry_type: 'on_hand' or 'received'
@@ -1496,7 +4117,10 @@ class NotionManager:
             notes: Optional notes
             quantities: Dict mapping item names to quantities
             image_file_id: Optional Telegram file ID for product image
-            
+            flagged: Whether this transaction has variance flags (Phase 4)
+            flag_reason: Reason for flagging (Phase 4)
+            photo_url: Direct URL to photo (Phase 3 - for Supabase)
+
         Returns:
             bool: True if successful
         """
@@ -1511,7 +4135,7 @@ class NotionManager:
             # Format quantities as readable JSON string for Notion
             quantities_summary = []
             for item_name, qty in quantities.items():
-                if qty > 0:  # Only show items with quantities
+                if qty >= 0:  # Show all items including 0 (so we know what's empty)
                     quantities_summary.append(f"{item_name}: {qty}")
             
             quantities_display = "\n".join(quantities_summary) if quantities_summary else "No items recorded"
@@ -1611,21 +4235,63 @@ class NotionManager:
                     self.logger.error(f"Error processing image: {e}")
                     # Continue without image rather than failing the entire transaction
             
-            # Create the page
-            page_data = {
-                'parent': {
-                    'database_id': self.inventory_db_id
-                },
-                'properties': properties
-            }
-            
-            response = self._make_request('POST', '/pages', page_data)
-            
+            # === PHASE 3: CONDITIONAL NOTION WRITES ===
+            NOTION_WRITES_ENABLED = os.environ.get('NOTION_WRITES_ENABLED', 'true').lower() == 'true'
+
+            if NOTION_WRITES_ENABLED:
+                # Create the page
+                page_data = {
+                    'parent': {
+                        'database_id': self.inventory_db_id
+                    },
+                    'properties': properties
+                }
+
+                response = self._make_request('POST', '/pages', page_data)
+                print(f"[PHASE 3] Notion write ENABLED for inventory transaction")
+            else:
+                response = {'id': 'supabase-only'}  # Fake success for flow
+                print(f"[PHASE 3] Notion write DISABLED - Supabase only for inventory transaction")
+            # === END PHASE 3 ===
+
             if response:
                 image_note = " with image" if image_file_id else ""
                 self.logger.info(f"Saved inventory transaction: {title}{image_note}")
                 self.logger.info(f"Items recorded: {len([q for q in quantities.values() if q > 0])}")
                 self.logger.info(f"Submitter property saved: '{manager}'")
+
+                # === DUAL-WRITE TO SUPABASE ===
+                # === PHASE 4: LOG FLAGGED STATUS ===
+                if flagged:
+                    print(f"[PHASE 4] ⚠ Transaction FLAGGED: {flag_reason}")
+                    self.logger.info(f"[PHASE 4] Flagged transaction: {flag_reason}")
+
+                # === PHASE 3: Get photo URL for Supabase ===
+                supabase_photo_url = photo_url  # Use direct URL if provided
+                if not supabase_photo_url and image_file_id:
+                    # Try to get URL from Telegram
+                    bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+                    if bot_token:
+                        supabase_photo_url = self._get_telegram_photo_url(image_file_id, bot_token)
+
+                print(f"[PHASE 1] Attempting dual-write for inventory transaction: {location} / {entry_type}")
+                self._write_to_supabase('inventory_transactions', {
+                    'date': date,
+                    'vendor': location,
+                    'type': 'on_hand' if entry_type == 'on_hand' else 'received',
+                    'quantities': quantities,
+                    'submitter': manager,
+                    'notes': notes if notes else None,
+                    'leader': None,
+                    'photo_url': supabase_photo_url,
+                    'flagged': flagged,
+                    'flag_reason': flag_reason
+                })
+
+                if supabase_photo_url:
+                    self.logger.info(f"[PHASE 3] Photo URL saved to Supabase: {supabase_photo_url[:50]}...")
+                # === END DUAL-WRITE ===
+
                 return True
             else:
                 self.logger.error(f"Failed to save inventory transaction")
@@ -1639,6 +4305,13 @@ class NotionManager:
             """
             FIXED: Query with correct Type values that match what's saved.
             """
+            # === SUPABASE FIRST (Phase 2) ===
+            supabase_result = self._read_inventory_from_supabase(location, entry_type)
+            if supabase_result is not None:
+                self.logger.info(f"[PHASE 2] Using Supabase for get_latest_inventory({location}, {entry_type})")
+                return supabase_result
+            # === FALLBACK TO NOTION ===
+
             try:
                 # FIX: Use "On-Hand" not "On-Hand Count"
                 type_select = "On-Hand" if entry_type == "on_hand" else "Received"
@@ -2345,6 +5018,8 @@ class TelegramBot:
         # THE ENTRY HANDLE
         self.entry_handler = EnhancedEntryHandler(self, notion_manager, calculator)
         self.order_handler = OrderFlowHandler(self, notion_manager, calculator)
+        self.report_handler = ReportHandler(self, notion_manager)
+        self.sop_handler = SOPHandler(self, notion_manager)
         
         # Rate limiting with exemptions
         self.user_commands: Dict[int, List[datetime]] = {}
@@ -2380,56 +5055,168 @@ class TelegramBot:
         if self.use_test_chat:
             self.logger.info(f"Test mode enabled - all messages will go to chat {self.test_chat}")
 
+        # Register bot commands with Telegram
+        self._register_bot_commands()
+
+    def _register_bot_commands(self):
+        """
+        Register bot commands with Telegram so they appear in the command menu.
+        Called during initialization.
+        """
+        commands = [
+            {"command": "start", "description": "Start the bot"},
+            {"command": "help", "description": "Show command reference"},
+            {"command": "entry", "description": "Record inventory counts"},
+            {"command": "order", "description": "Create supplier order"},
+            {"command": "info", "description": "View inventory analysis"},
+            {"command": "reassurance", "description": "Risk assessment report"},
+            {"command": "review", "description": "View recent submissions"},
+            {"command": "pars", "description": "View/edit item par levels"},
+            {"command": "flags", "description": "Review flagged transactions"},
+            {"command": "cycles", "description": "View consumption cycles"},
+            {"command": "adu", "description": "View average daily usage"},
+            {"command": "viewtasks", "description": "View your pending tasks"},
+            {"command": "status", "description": "System health check"},
+            {"command": "cancel", "description": "Cancel current operation"},
+        ]
+
+        try:
+            url = f"{self.base_url}/setMyCommands"
+            response = requests.post(url, json={"commands": commands}, timeout=10)
+
+            if response.status_code == 200:
+                print(f"[BOT] ✓ Registered {len(commands)} commands with Telegram")
+                self.logger.info(f"Bot commands registered successfully")
+            else:
+                print(f"[BOT] ⚠ Failed to register commands: {response.text}")
+                self.logger.warning(f"Failed to register bot commands: {response.text}")
+        except Exception as e:
+            print(f"[BOT] ⚠ Error registering commands: {e}")
+            self.logger.warning(f"Error registering bot commands: {e}")
+
+    def _get_notification_config(self, vendor: str, notification_type: str, session_token: str) -> dict:
+        """
+        Get notification configuration from database for a vendor.
+
+        Args:
+            vendor: Vendor name
+            notification_type: Type of notification (entry_confirmation, order_reminder, etc.)
+            session_token: Correlation token for logging
+
+        Returns:
+            dict with keys:
+                - telegram_ids: List of individual user telegram_ids to notify
+                - group_chat_id: Group chat ID (or None)
+                - found: Whether config was found in database
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            self.logger.warning(f"[{session_token}] Supabase not available for notification config lookup")
+            return {'telegram_ids': [], 'group_chat_id': None, 'found': False}
+
+        try:
+            self.logger.info(f"[{session_token}] Looking up notification config | vendor='{vendor}' type='{notification_type}'")
+            print(f"[DEBUG] Looking up notification config for vendor='{vendor}' type='{notification_type}'")
+
+            result = _supabase_client.table('vendor_notifications') \
+                .select('telegram_ids, group_chat_id, vendor, enabled') \
+                .eq('vendor', vendor) \
+                .eq('notification_type', notification_type) \
+                .eq('enabled', True) \
+                .execute()
+
+            self.logger.info(f"[{session_token}] Query result: {len(result.data) if result.data else 0} records found")
+            print(f"[DEBUG] Query result: {result.data}")
+
+            if result.data and len(result.data) > 0:
+                config = result.data[0]
+                telegram_ids = config.get('telegram_ids') or []
+                group_chat_id = config.get('group_chat_id')
+                self.logger.info(f"[{session_token}] Found notification config in database | vendor={vendor} "
+                               f"type={notification_type} users={len(telegram_ids)} group={group_chat_id}")
+                return {
+                    'telegram_ids': telegram_ids,
+                    'group_chat_id': group_chat_id,
+                    'found': True
+                }
+            else:
+                # No config found - log available vendors for debugging
+                self.logger.warning(f"[{session_token}] No notification config found for vendor='{vendor}' type='{notification_type}'")
+                print(f"[DEBUG] No notification config found for vendor='{vendor}'")
+                try:
+                    # Query all entry_confirmation configs to show what vendors exist
+                    all_configs = _supabase_client.table('vendor_notifications') \
+                        .select('vendor, notification_type, telegram_ids') \
+                        .eq('notification_type', notification_type) \
+                        .execute()
+                    if all_configs.data:
+                        vendors_in_db = [c.get('vendor') for c in all_configs.data]
+                        self.logger.info(f"[{session_token}] Available vendors in DB for {notification_type}: {vendors_in_db}")
+                        print(f"[DEBUG] Available vendors in DB: {vendors_in_db}")
+                except Exception as diag_err:
+                    self.logger.warning(f"[{session_token}] Diagnostic query failed: {diag_err}")
+        except Exception as e:
+            self.logger.warning(f"[{session_token}] Error fetching notification config | vendor={vendor} error={e}")
+
+        return {'telegram_ids': [], 'group_chat_id': None, 'found': False}
+
+    def _notify_individual_users(self, telegram_ids: list, message: str, session_token: str) -> int:
+        """
+        Send notification message to individual users.
+
+        Args:
+            telegram_ids: List of telegram user IDs to notify
+            message: Message to send
+            session_token: Correlation token for logging
+
+        Returns:
+            int: Number of successful sends
+        """
+        success_count = 0
+        for user_id in telegram_ids:
+            try:
+                if self.send_message(user_id, message):
+                    success_count += 1
+                    self.logger.debug(f"[{session_token}] Sent notification to user | user_id={user_id}")
+                else:
+                    self.logger.warning(f"[{session_token}] Failed to send notification | user_id={user_id}")
+            except Exception as e:
+                self.logger.warning(f"[{session_token}] Error sending notification | user_id={user_id} error={e}")
+
+        self.logger.info(f"[{session_token}] Individual notifications sent | success={success_count}/{len(telegram_ids)}")
+        return success_count
+
     def _resolve_order_prep_chat(self, vendor: str, session_token: str) -> Optional[int]:
         """
-        Resolve order prep chat ID with vendor-specific override and global fallback.
-        
-        Resolution order:
-        1. Vendor-specific: prep_chat:{vendor}
-        2. Global fallback: prep_chat:default
-        3. None (block with guidance)
-        
+        Resolve order prep chat ID from database only.
+
+        All notification configuration should be done through the dashboard.
+        No .env fallback - configure via Notifications > Entry Confirmations.
+
         Args:
-            vendor: Vendor name (Avondale or Commissary)
+            vendor: Vendor name
             session_token: Correlation token for logging
-            
+
         Returns:
-            Optional[int]: Chat ID or None if unresolvable
-            
-        Logs: resolution attempts, fallback path, success/failure
+            Optional[int]: Group chat ID or None if not configured
         """
         self.logger.info(f"[{session_token}] Resolving order prep chat | vendor={vendor}")
-        
-        # Try vendor-specific first
-        vendor_key = f"prep_chat:{vendor}"
-        vendor_chat = self.chat_config.get(vendor_key, '').strip()
-        
-        if vendor_chat:
-            try:
-                chat_id = int(vendor_chat)
-                self.logger.info(f"[{session_token}] Resolved to vendor-specific chat | key={vendor_key} chat_id={chat_id}")
+
+        # Get notification config from database ONLY (no .env fallback)
+        notification_config = self._get_notification_config(vendor, 'entry_confirmation', session_token)
+
+        if notification_config['found']:
+            if notification_config['group_chat_id']:
+                chat_id = notification_config['group_chat_id']
+                self.logger.info(f"[{session_token}] Resolved group chat from database | vendor={vendor} chat_id={chat_id}")
                 return chat_id
-            except ValueError:
-                self.logger.warning(f"[{session_token}] Invalid vendor-specific chat ID | key={vendor_key} value='{vendor_chat}'")
-        else:
-            self.logger.debug(f"[{session_token}] Vendor-specific chat not configured | key={vendor_key}")
-        
-        # Try global fallback
-        default_chat = self.chat_config.get('prep_chat:default', '').strip()
-        
-        if default_chat:
-            try:
-                chat_id = int(default_chat)
-                self.logger.info(f"[{session_token}] Resolved to global fallback chat | chat_id={chat_id}")
-                return chat_id
-            except ValueError:
-                self.logger.warning(f"[{session_token}] Invalid global fallback chat ID | value='{default_chat}'")
-        else:
-            self.logger.debug(f"[{session_token}] Global fallback not configured")
-        
-        # Nothing resolved
-        self.logger.error(f"[{session_token}] No order prep chat resolvable | vendor={vendor} | "
-                        f"Set ORDER_PREP_CHAT_ID or ORDER_PREP_CHAT_ID_{vendor.upper()} in .env")
+            elif notification_config['telegram_ids']:
+                self.logger.info(f"[{session_token}] No group chat but individual users configured | vendor={vendor}")
+                return None  # Will use individual notifications instead
+
+        # No config found
+        self.logger.warning(f"[{session_token}] No notification config for vendor={vendor} | Configure in dashboard")
         return None
 
     # ===== CONVERSATION STATE MANAGEMENT =====
@@ -2588,6 +5375,69 @@ class TelegramBot:
         
         self.logger.error(f"Failed to send message to chat {chat_id}")
         return False
+
+    def send_variance_notification(self, location: str, submitter: str,
+                                    item_name: str, expected: float, actual: float,
+                                    variance_pct: float, photo_file_id: str = None):
+        """
+        Send variance notification to managers.
+
+        Args:
+            location: Vendor/location where variance occurred
+            submitter: Who submitted the count
+            item_name: Item with variance
+            expected: Expected quantity
+            actual: Actual counted quantity
+            variance_pct: Variance percentage (0.20 = 20%)
+            photo_file_id: Optional Telegram file ID for photo
+        """
+        # Get managers for this location
+        managers = self.notion.get_managers_for_location(location)
+
+        if not managers:
+            self.logger.warning(f"[PHASE 4] No managers found for {location} - notification skipped")
+            return
+
+        # Build notification message
+        direction = "OVER" if actual > expected else "UNDER"
+        variance_str = f"{variance_pct:.0%}"
+
+        message = (
+            f"⚠️ <b>VARIANCE ALERT</b>\n"
+            f"{'=' * 25}\n\n"
+            f"<b>Location:</b> {location}\n"
+            f"<b>Item:</b> {item_name}\n"
+            f"<b>Submitted by:</b> {submitter}\n\n"
+            f"<b>Expected:</b> {expected:.1f}\n"
+            f"<b>Actual:</b> {actual}\n"
+            f"<b>Variance:</b> {variance_str} {direction}\n"
+        )
+
+        if photo_file_id:
+            message += f"\n<i>Photo confirmation attached below.</i>"
+
+        # Send to each manager
+        for manager in managers:
+            manager_id = manager.get('telegram_id')
+            manager_name = manager.get('name', 'Unknown')
+
+            try:
+                # Send text message
+                self.send_message(manager_id, message)
+
+                # Send photo if available
+                if photo_file_id:
+                    self._make_request("sendPhoto", {
+                        "chat_id": manager_id,
+                        "photo": photo_file_id,
+                        "caption": f"Variance photo: {item_name} @ {location}"
+                    })
+
+                self.logger.info(f"[PHASE 4] Variance notification sent to {manager_name} ({manager_id})")
+                print(f"[PHASE 4] Variance notification sent to manager: {manager_name}")
+
+            except Exception as e:
+                self.logger.error(f"[PHASE 4] Failed to notify manager {manager_name}: {e}")
 
     def _save_order_to_notion(self, location: str, summary: Dict[str, Any]):
         """Save order to Notion for shortage tracking."""
@@ -2884,6 +5734,7 @@ class TelegramBot:
                 self._cleanup_stale_conversations()
                 self.entry_handler.cleanup_expired_sessions()
                 self.order_handler.cleanup_expired_sessions()
+                self.report_handler.cleanup_expired_sessions()
                 # Get updates
                 updates = self.get_updates(timeout=25)
                 
@@ -2934,7 +5785,17 @@ class TelegramBot:
                 if callback_data.startswith("order_"):
                     self.order_handler.handle_callback(update["callback_query"])
                     return
-                
+
+                # Route report callbacks
+                if callback_data.startswith("report_"):
+                    self.report_handler.handle_callback(update["callback_query"])
+                    return
+
+                # Route SOP callbacks
+                if callback_data.startswith("sop_"):
+                    self.sop_handler.handle_callback(update["callback_query"])
+                    return
+
                 # Handle other callbacks
                 self._handle_callback_safe(update["callback_query"])
                 return
@@ -2960,13 +5821,41 @@ class TelegramBot:
                 session = self.entry_handler.sessions[user_id]
                 if not session.is_expired():
                     if 'photo' in message:
-                        if session.mode == "received" and session.current_step == "image":
+                        # Debug logging
+                        print(f"[DEBUG] Photo received for user {user_id}")
+                        print(f"[DEBUG] Session mode: {session.mode}, current_step: {getattr(session, 'current_step', 'NOT SET')}")
+                        # Handle photos for received deliveries OR variance confirmation
+                        if (session.mode == "received" and session.current_step == "image") or session.current_step == "variance_photo":
+                            print(f"[DEBUG] Routing to handle_photo_input")
                             self.entry_handler.handle_photo_input(message, session)
+                        else:
+                            print(f"[DEBUG] Photo NOT routed - conditions not met")
                         return
                     elif 'text' in message:
                         self.entry_handler.handle_text_input(message, session)
                         return
-            
+
+            # Check for report session
+            if hasattr(self, 'report_handler') and user_id in self.report_handler.sessions:
+                session = self.report_handler.sessions[user_id]
+                if not session.is_expired():
+                    if 'photo' in message:
+                        self.report_handler.handle_photo_input(message, session)
+                        return
+                    elif 'video' in message:
+                        self.report_handler.handle_video_input(message, session)
+                        return
+                    elif 'text' in message:
+                        self.report_handler.handle_text_input(message, session)
+                        return
+
+            # Check for SOP session input (photo/text for confirmation steps)
+            if hasattr(self, 'sop_handler') and user_id in self.sop_handler.sessions:
+                session = self.sop_handler.sessions[user_id]
+                if not session.is_expired():
+                    if self.sop_handler.handle_text_input(message):
+                        return
+
             # Handle text messages and commands
             if "text" in message:
                 text = sanitize_user_input(message.get("text", ""))
@@ -3023,9 +5912,17 @@ class TelegramBot:
             "/status": self._handle_status,
             "/cancel": self._handle_cancel,
             "/adu": self._handle_adu,
-            "/missing": self._handle_missing,
+            "/review": self._handle_review,
+            "/pars": self._handle_pars,
+            "/flags": self._handle_flags,
+            "/cycles": self._handle_cycles,
+            "/reports": self.report_handler.handle_reports_command,
+            "/sop": self.sop_handler.handle_sop_command,
+            "/viewtasks": self._handle_viewtasks,
+            "/mytasks": self._handle_viewtasks,
+            "/tasks": self._handle_viewtasks,
         }
-        
+
         handler = handlers.get(command)
         if handler:
             try:
@@ -3062,7 +5959,7 @@ class TelegramBot:
                             "⚠️ Error processing input. Please try /cancel and start over.")
 
     # ===== CALLBACK HANDLING =====
-    
+
     def _handle_callback(self, callback_query: Dict):
         """Handle inline keyboard callbacks."""
         data = callback_query.get("data", "")
@@ -3074,18 +5971,18 @@ class TelegramBot:
         if data.startswith("entry_"):
             self.entry_handler.handle_callback(callback_query)
             return
-        
+
         # Acknowledge callback
-        self._make_request("answerCallbackQuery", 
+        self._make_request("answerCallbackQuery",
                           {"callback_query_id": callback_query.get("id")})
-        
+
         with self.conversation_lock:
             state = self.conversations.get(user_id)
-        
+
         if not state:
             self.send_message(chat_id, "Session expired. Use /entry to start again.")
             return
-        
+
         # Route callback based on data
         if data.startswith("loc|"):
             self._handle_location_callback(state, data)
@@ -3167,7 +6064,7 @@ class TelegramBot:
             text = (
                 "🚀 <b>K2 Restaurant Inventory System</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Version 3.0.0 • Status: {system_status}\n\n"
+                f"Version {SYSTEM_VERSION} • Status: {system_status}\n\n"
                 
                 "📊 <b>Core Commands</b>\n"
                 "├ /entry — Record inventory counts\n"
@@ -3196,23 +6093,41 @@ class TelegramBot:
         text = (
             "📚 <b>Command Reference</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            
+
             "📝 <b>Data Entry</b>\n"
             "/entry — Interactive inventory recording\n"
             "  • Choose location → type → date\n"
             "  • Enter quantities or skip items\n"
-            "  • Saves directly to Notion\n\n"
-            
+            "  • Saves directly to database\n\n"
+
             "📊 <b>Analytics & Reports</b>\n"
             "/info — Real-time inventory analysis\n"
             "/order — Supplier-ready order lists\n"
             "/reassurance — Risk assessment\n\n"
-            
+
             "🔍 <b>Quick Checks</b>\n"
             "/adu — Average daily usage rates\n"
-            "/missing [location] [date] — Missing counts\n"
             "/status — System health check\n\n"
-            
+
+            "📋 <b>Reports & SOPs</b>\n"
+            "/reports — Submit configurable reports\n"
+            "  • Select report type → answer questions\n"
+            "  • Supports text, photos, videos\n"
+            "/sop — Execute Standard Operating Procedures\n"
+            "  • Step-by-step guided workflows\n"
+            "  • Tracks completion and responses\n\n"
+
+            "📊 <b>Admin Commands</b>\n"
+            "/review — View recent submissions\n"
+            "/pars — View item par levels\n"
+            "/flags — Review flagged transactions\n"
+            "/cycles — View consumption cycles\n\n"
+            "💻 <b>Admin Dashboard</b>\n"
+            "Use the web dashboard for full configuration:\n"
+            "• Forecasts, deadlines, count schedules\n"
+            "• Item management, par editing\n"
+            "• Detailed analytics\n\n"
+
             "💡 <b>Tips</b>\n"
             "• Use 'today' for current date\n"
             "• Type /skip to skip items\n"
@@ -3221,6 +6136,644 @@ class TelegramBot:
         )
         self.send_message(chat_id, text)
 
+    # ===== ADMIN COMMANDS =====
+    # Configuration commands (forecast, deadlines, setcount, setescalation) moved to Admin Dashboard
+
+    def _handle_review(self, message: Dict):
+        """
+        Handle /review command - view recent inventory/order submissions.
+
+        Usage:
+            /review - Show today's submissions
+            /review <location> - Show today for specific location
+            /review <location> <date> - Show specific date (YYYY-MM-DD)
+        """
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+
+        print(f"[REVIEW-CMD] Received: {text}")
+        self.logger.info(f"[REVIEW-CMD] {text}")
+
+        parts = text.split()
+
+        # Parse arguments
+        location = None
+        target_date = get_time_in_timezone(BUSINESS_TIMEZONE).date()
+
+        if len(parts) >= 2:
+            location = parts[1]
+
+        if len(parts) >= 3:
+            try:
+                target_date = datetime.strptime(parts[2], '%Y-%m-%d').date()
+            except ValueError:
+                self.send_message(chat_id, "❌ Invalid date format. Use YYYY-MM-DD")
+                return
+
+        # Query submissions
+        submissions = self._get_submissions_for_date(target_date, location)
+
+        if not submissions:
+            location_text = f" for {location}" if location else ""
+            self.send_message(chat_id,
+                f"📋 No submissions found{location_text} on {target_date}\n\n"
+                f"Use /review [location] [date] to search other dates.")
+            return
+
+        # Format response
+        date_str = target_date.strftime('%A, %b %d')
+        text_out = f"📋 <b>SUBMISSIONS: {date_str}</b>\n"
+        if location:
+            text_out += f"📍 Location: {location}\n"
+        text_out += "\n"
+
+        # Group by location then type
+        by_location = {}
+        for sub in submissions:
+            loc = sub.get('vendor', 'Unknown')
+            if loc not in by_location:
+                by_location[loc] = []
+            by_location[loc].append(sub)
+
+        for loc, subs in by_location.items():
+            text_out += f"<b>📍 {loc}</b>\n"
+
+            for sub in subs:
+                sub_type = sub.get('type', 'unknown')
+                submitter = sub.get('submitter', 'Unknown')
+                created = sub.get('created_at', '')
+                flagged = sub.get('flagged', False)
+
+                # Parse time
+                try:
+                    if isinstance(created, str):
+                        created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                        time_str = created_dt.strftime('%I:%M %p')
+                    else:
+                        time_str = 'Unknown'
+                except:
+                    time_str = 'Unknown'
+
+                # Type icons
+                type_icons = {
+                    'on_hand': '📦',
+                    'received': '📥',
+                    'order': '📤'
+                }
+                icon = type_icons.get(sub_type, '📝')
+
+                # Flag indicator
+                flag_str = ' 🚩' if flagged else ''
+
+                # Count items
+                quantities = sub.get('quantities', {})
+                if isinstance(quantities, str):
+                    try:
+                        quantities = json.loads(quantities)
+                    except:
+                        quantities = {}
+                item_count = len([v for v in quantities.values() if v and v > 0])
+
+                text_out += f"  {icon} {sub_type.upper()}: {submitter} @ {time_str}{flag_str}\n"
+                text_out += f"     └ {item_count} items\n"
+
+            text_out += "\n"
+
+        # Add navigation hint
+        text_out += (
+            f"─────────────────────\n"
+            f"<code>/review [location] [YYYY-MM-DD]</code>"
+        )
+
+        self.send_message(chat_id, text_out)
+        print(f"[REVIEW-CMD] ✓ Showed {len(submissions)} submissions")
+
+    def _get_submissions_for_date(self, target_date, location: str = None) -> list:
+        """
+        Query submissions from Supabase for a specific date.
+        """
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            print(f"[REVIEW] Supabase not available")
+            return []
+
+        try:
+            # Build query
+            query = _supabase_client.table('inventory_transactions') \
+                .select('*') \
+                .gte('created_at', target_date.isoformat()) \
+                .lt('created_at', (target_date + timedelta(days=1)).isoformat()) \
+                .order('created_at', desc=True)
+
+            if location:
+                query = query.eq('vendor', location)
+
+            result = query.execute()
+
+            if result.data:
+                print(f"[REVIEW] ✓ Found {len(result.data)} submissions for {target_date}")
+                return result.data
+
+            return []
+
+        except Exception as e:
+            print(f"[REVIEW] ✗ Query failed: {e}")
+            self.logger.error(f"[REVIEW] Error: {e}")
+            return []
+
+    def _handle_pars(self, message: Dict):
+        """
+        Handle /pars command - view and adjust item par levels.
+
+        Usage:
+            /pars <location> - Show all pars for location
+            /pars <location> <item> - Show specific item
+            /pars <location> <item> <min> <max> - Update pars
+        """
+        chat_id = message["chat"]["id"]
+        user_name = message["from"].get("first_name", "Unknown")
+        text = message.get("text", "").strip()
+
+        print(f"[PARS-CMD] Received: {text}")
+        self.logger.info(f"[PARS-CMD] {text}")
+
+        # Parse with quote handling for item names
+        parts = self._parse_quoted_args(text)
+
+        # /pars alone - show help
+        if len(parts) == 1:
+            self.send_message(chat_id,
+                "📊 <b>Par Management</b>\n\n"
+                "Usage:\n"
+                "<code>/pars [location]</code> - View all pars\n"
+                "<code>/pars [location] \"[item]\"</code> - View item\n"
+                "<code>/pars [location] \"[item]\" [min] [max]</code> - Update\n\n"
+                "Examples:\n"
+                "<code>/pars Avondale</code>\n"
+                "<code>/pars Avondale \"Chicken Wings\"</code>\n"
+                "<code>/pars Avondale \"Chicken Wings\" 30 60</code>")
+            return
+
+        location = parts[1]
+
+        # /pars <location> - show all pars
+        if len(parts) == 2:
+            self._show_location_pars(chat_id, location)
+            return
+
+        item_name = parts[2]
+
+        # /pars <location> <item> - show item pars
+        if len(parts) == 3:
+            self._show_item_pars(chat_id, location, item_name)
+            return
+
+        # /pars <location> <item> <min> <max> - update pars
+        if len(parts) >= 5:
+            try:
+                new_min = float(parts[3])
+                new_max = float(parts[4])
+            except ValueError:
+                self.send_message(chat_id, "❌ Invalid par values. Use numbers.")
+                return
+
+            if new_min >= new_max:
+                self.send_message(chat_id, "❌ Min par must be less than max par.")
+                return
+
+            self._update_item_pars(chat_id, location, item_name, new_min, new_max, user_name)
+            return
+
+        self.send_message(chat_id, "❌ Invalid syntax. Use /pars for help.")
+
+    def _parse_quoted_args(self, text: str) -> list:
+        """
+        Parse command arguments with quote support.
+
+        Example: '/pars Avondale "Chicken Wings" 30 60'
+        Returns: ['/pars', 'Avondale', 'Chicken Wings', '30', '60']
+        """
+        import shlex
+        try:
+            return shlex.split(text)
+        except:
+            return text.split()
+
+    def _show_location_pars(self, chat_id: int, location: str):
+        """Show all pars for a location."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            self.send_message(chat_id, "❌ Database not available")
+            return
+
+        try:
+            result = _supabase_client.table('inventory_items') \
+                .select('item_name, min_par, max_par, avg_consumption') \
+                .eq('vendor', location) \
+                .eq('active', True) \
+                .order('item_name') \
+                .execute()
+
+            if not result.data:
+                self.send_message(chat_id, f"❌ No items found for '{location}'")
+                return
+
+            text = f"📊 <b>PARS: {location}</b>\n\n"
+            text += "Item | Min | Max\n"
+            text += "─────────────────────────\n"
+
+            unconfigured = 0
+            for item in result.data:
+                name = item['item_name'][:20]  # Truncate long names
+                min_p = item.get('min_par', 0) or 0
+                max_p = item.get('max_par', 0) or 0
+
+                if min_p == 0 and max_p == 0:
+                    unconfigured += 1
+                    text += f"⚠️ {name}: NOT SET\n"
+                else:
+                    text += f"  {name}: {min_p:.0f} - {max_p:.0f}\n"
+
+            text += (
+                f"\n─────────────────────────\n"
+                f"📦 {len(result.data)} items total\n"
+            )
+            if unconfigured > 0:
+                text += f"⚠️ {unconfigured} without pars\n"
+
+            text += f"\nTo update:\n<code>/pars {location} \"[item]\" [min] [max]</code>"
+
+            self.send_message(chat_id, text)
+            print(f"[PARS-CMD] ✓ Showed {len(result.data)} items for {location}")
+
+        except Exception as e:
+            print(f"[PARS-CMD] ✗ Error: {e}")
+            self.send_message(chat_id, "❌ Failed to load pars")
+
+    def _show_item_pars(self, chat_id: int, location: str, item_name: str):
+        """Show pars and history for a specific item."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            self.send_message(chat_id, "❌ Database not available")
+            return
+
+        try:
+            # Get item
+            item_result = _supabase_client.table('inventory_items') \
+                .select('*') \
+                .eq('vendor', location) \
+                .ilike('item_name', f'%{item_name}%') \
+                .limit(1) \
+                .execute()
+
+            if not item_result.data:
+                self.send_message(chat_id, f"❌ Item '{item_name}' not found in {location}")
+                return
+
+            item = item_result.data[0]
+
+            # Get par history
+            history_result = _supabase_client.table('par_history') \
+                .select('*') \
+                .eq('item_id', item['id']) \
+                .order('created_at', desc=True) \
+                .limit(5) \
+                .execute()
+
+            text = (
+                f"📊 <b>ITEM: {item['item_name']}</b>\n"
+                f"📍 Location: {location}\n\n"
+                f"<b>Current Pars:</b>\n"
+                f"  📉 Min: {item.get('min_par', 0) or 0:.1f}\n"
+                f"  📈 Max: {item.get('max_par', 0) or 0:.1f}\n"
+                f"  📊 Avg consumption: {item.get('avg_consumption', 0) or 0:.2f}/day\n"
+            )
+
+            if history_result.data:
+                text += f"\n<b>Par History:</b>\n"
+                for h in history_result.data[:5]:
+                    date = h.get('created_at', '')[:10]
+                    old_min = h.get('old_min_par', 0) or 0
+                    old_max = h.get('old_max_par', 0) or 0
+                    new_min = h.get('new_min_par', 0) or 0
+                    new_max = h.get('new_max_par', 0) or 0
+                    reason = h.get('reason', '')[:30]
+
+                    text += f"  {date}: {old_min:.0f}-{old_max:.0f} → {new_min:.0f}-{new_max:.0f}\n"
+                    if reason:
+                        text += f"    └ {reason}\n"
+
+            text += (
+                f"\n─────────────────────────\n"
+                f"To update:\n"
+                f"<code>/pars {location} \"{item['item_name']}\" [min] [max]</code>"
+            )
+
+            self.send_message(chat_id, text)
+            print(f"[PARS-CMD] ✓ Showed pars for {item['item_name']}")
+
+        except Exception as e:
+            print(f"[PARS-CMD] ✗ Error: {e}")
+            self.send_message(chat_id, "❌ Failed to load item")
+
+    def _update_item_pars(self, chat_id: int, location: str, item_name: str,
+                          new_min: float, new_max: float, updated_by: str):
+        """Update par levels for an item."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            self.send_message(chat_id, "❌ Database not available")
+            return
+
+        try:
+            # Find item
+            item_result = _supabase_client.table('inventory_items') \
+                .select('id, item_name, min_par, max_par') \
+                .eq('vendor', location) \
+                .ilike('item_name', f'%{item_name}%') \
+                .limit(1) \
+                .execute()
+
+            if not item_result.data:
+                self.send_message(chat_id, f"❌ Item '{item_name}' not found in {location}")
+                return
+
+            item = item_result.data[0]
+            old_min = item.get('min_par', 0) or 0
+            old_max = item.get('max_par', 0) or 0
+
+            print(f"[PARS-CMD] Updating {item['item_name']}: {old_min}-{old_max} → {new_min}-{new_max}")
+
+            # Update item
+            update_result = _supabase_client.table('inventory_items') \
+                .update({
+                    'min_par': new_min,
+                    'max_par': new_max,
+                    'last_par_update': datetime.now().isoformat()
+                }) \
+                .eq('id', item['id']) \
+                .execute()
+
+            if not update_result.data:
+                self.send_message(chat_id, "❌ Failed to update pars")
+                return
+
+            # Log to par_history
+            _supabase_client.table('par_history') \
+                .insert({
+                    'item_id': item['id'],
+                    'old_min_par': old_min,
+                    'old_max_par': old_max,
+                    'new_min_par': new_min,
+                    'new_max_par': new_max,
+                    'reason': f'Manual update by {updated_by}'
+                }) \
+                .execute()
+
+            self.send_message(chat_id,
+                f"✅ <b>Pars Updated</b>\n\n"
+                f"📦 {item['item_name']}\n"
+                f"📍 {location}\n\n"
+                f"Old: {old_min:.0f} - {old_max:.0f}\n"
+                f"New: {new_min:.0f} - {new_max:.0f}\n\n"
+                f"Updated by: {updated_by}")
+
+            print(f"[PARS-CMD] ✓ Updated pars for {item['item_name']}")
+            self.logger.info(f"[PARS-CMD] Updated {item['item_name']}: {new_min}-{new_max} by {updated_by}")
+
+        except Exception as e:
+            print(f"[PARS-CMD] ✗ Update failed: {e}")
+            self.send_message(chat_id, "❌ Failed to update pars")
+
+    def _handle_flags(self, message: Dict):
+        """
+        Handle /flags command - review flagged variance transactions.
+
+        Usage:
+            /flags - Show all unresolved flags
+            /flags <location> - Show flags for location
+            /flags resolve <id> - Mark flag as resolved
+        """
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+
+        print(f"[FLAGS-CMD] Received: {text}")
+        self.logger.info(f"[FLAGS-CMD] {text}")
+
+        parts = text.split()
+
+        # /flags resolve <id>
+        if len(parts) >= 3 and parts[1].lower() == 'resolve':
+            flag_id = parts[2]
+            self._resolve_flag(chat_id, flag_id)
+            return
+
+        # /flags or /flags <location>
+        location = parts[1] if len(parts) >= 2 else None
+        self._show_flags(chat_id, location)
+
+    def _show_flags(self, chat_id: int, location: str = None):
+        """Show flagged transactions."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            self.send_message(chat_id, "❌ Database not available")
+            return
+
+        try:
+            query = _supabase_client.table('inventory_transactions') \
+                .select('*') \
+                .eq('flagged', True) \
+                .order('created_at', desc=True) \
+                .limit(20)
+
+            if location:
+                query = query.eq('vendor', location)
+
+            result = query.execute()
+
+            if not result.data:
+                location_text = f" for {location}" if location else ""
+                self.send_message(chat_id,
+                    f"✅ No flagged transactions{location_text}!\n\n"
+                    f"Great job on count accuracy.")
+                return
+
+            text = "🚩 <b>FLAGGED TRANSACTIONS</b>\n\n"
+
+            for flag in result.data[:10]:
+                flag_id = flag.get('id', '')[:8]
+                vendor = flag.get('vendor', 'Unknown')
+                submitter = flag.get('submitter', 'Unknown')
+                flag_reason = flag.get('flag_reason', 'Variance detected')
+                created = flag.get('created_at', '')[:10]
+
+                text += (
+                    f"🚩 <b>ID: {flag_id}...</b>\n"
+                    f"  📍 {vendor}\n"
+                    f"  👤 {submitter}\n"
+                    f"  📅 {created}\n"
+                    f"  ⚠️ {flag_reason}\n\n"
+                )
+
+            if len(result.data) > 10:
+                text += f"<i>... and {len(result.data) - 10} more</i>\n\n"
+
+            text += (
+                f"─────────────────────────\n"
+                f"To resolve:\n"
+                f"<code>/flags resolve [id]</code>"
+            )
+
+            self.send_message(chat_id, text)
+            print(f"[FLAGS-CMD] ✓ Showed {len(result.data)} flags")
+
+        except Exception as e:
+            print(f"[FLAGS-CMD] ✗ Error: {e}")
+            self.send_message(chat_id, "❌ Failed to load flags")
+
+    def _resolve_flag(self, chat_id: int, flag_id: str):
+        """Mark a flag as resolved."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            self.send_message(chat_id, "❌ Database not available")
+            return
+
+        try:
+            # Find the transaction
+            result = _supabase_client.table('inventory_transactions') \
+                .select('*') \
+                .ilike('id', f'{flag_id}%') \
+                .eq('flagged', True) \
+                .limit(1) \
+                .execute()
+
+            if not result.data:
+                self.send_message(chat_id, f"❌ Flag '{flag_id}' not found or already resolved")
+                return
+
+            transaction = result.data[0]
+
+            # Update to unflag
+            update_result = _supabase_client.table('inventory_transactions') \
+                .update({
+                    'flagged': False,
+                    'flag_reason': f"RESOLVED: {transaction.get('flag_reason', '')}"
+                }) \
+                .eq('id', transaction['id']) \
+                .execute()
+
+            if update_result.data:
+                self.send_message(chat_id,
+                    f"✅ <b>Flag Resolved</b>\n\n"
+                    f"📍 {transaction.get('vendor')}\n"
+                    f"👤 {transaction.get('submitter')}\n"
+                    f"📅 {transaction.get('created_at', '')[:10]}")
+                print(f"[FLAGS-CMD] ✓ Resolved flag {flag_id}")
+            else:
+                self.send_message(chat_id, "❌ Failed to resolve flag")
+
+        except Exception as e:
+            print(f"[FLAGS-CMD] ✗ Resolve failed: {e}")
+            self.send_message(chat_id, "❌ Failed to resolve flag")
+
+    # ===== END ADMIN COMMANDS =====
+
+    # ===== CYCLE COMMANDS =====
+
+    def _handle_cycles(self, message: Dict):
+        """
+        Handle /cycles command - view consumption cycle status.
+
+        Usage:
+            /cycles - Show recent cycles and flagged items
+            /cycles <location> - Filter by location
+        """
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+
+        print(f"[CYCLES-CMD] Received: {text}")
+
+        parts = text.split()
+        location = parts[1] if len(parts) > 1 else None
+
+        # Get flagged cycles
+        flagged = self.notion.get_flagged_cycles(location)
+
+        # Get recent closed cycles
+        recent = self._get_recent_cycles(location)
+
+        text_out = "🔄 <b>CONSUMPTION CYCLES</b>\n\n"
+
+        # Show flagged first
+        if flagged:
+            text_out += f"⚠️ <b>FLAGGED FOR REVIEW ({len(flagged)})</b>\n"
+            for cycle in flagged[:5]:
+                item = cycle.get('item_name', 'Unknown')
+                drift = cycle.get('drift_percentage', 0) or 0
+                loc = cycle.get('location', '')
+                text_out += f"  🚩 {item} ({loc}): {drift:.0f}% drift\n"
+            text_out += "\n"
+        else:
+            text_out += "✅ No cycles flagged for review\n\n"
+
+        # Show recent cycles
+        if recent:
+            text_out += f"<b>RECENT CYCLES</b>\n"
+            for cycle in recent[:10]:
+                item = cycle.get('item_name', 'Unknown')[:15]
+                status = cycle.get('status', 'unknown')
+                drift = cycle.get('drift_percentage', 0) or 0
+
+                status_icons = {
+                    'open': '🔵',
+                    'closed': '✅',
+                    'flagged': '🚩',
+                    'adjusted': '🔧'
+                }
+                icon = status_icons.get(status, '❓')
+
+                text_out += f"  {icon} {item}: {drift:.0f}% ({status})\n"
+        else:
+            text_out += "No recent cycles\n"
+
+        text_out += (
+            f"\n─────────────────────────\n"
+            f"Cycles auto-adjust pars when drift >25% for 2 consecutive cycles."
+        )
+
+        self.send_message(chat_id, text_out)
+        print(f"[CYCLES-CMD] ✓ Showed {len(flagged)} flagged, {len(recent)} recent")
+
+    def _get_recent_cycles(self, location: str = None, limit: int = 10) -> list:
+        """Get recently closed/adjusted cycles."""
+        global _supabase_client, _supabase_enabled
+
+        if not _supabase_enabled or not _supabase_client:
+            return []
+
+        try:
+            query = _supabase_client.table('consumption_cycles') \
+                .select('*') \
+                .in_('status', ['closed', 'adjusted', 'flagged', 'open']) \
+                .order('updated_at', desc=True) \
+                .limit(limit)
+
+            if location:
+                query = query.eq('location', location)
+
+            result = query.execute()
+            return result.data or []
+
+        except Exception as e:
+            print(f"[CYCLES-CMD] ✗ Error: {e}")
+            return []
+
+    # ===== END CYCLE COMMANDS =====
 
     def _handle_status(self, message: Dict):
         """System diagnostics with visual indicators"""
@@ -3266,10 +6819,104 @@ class TelegramBot:
                 "Please contact support if this persists."
             ))
 
+    def _handle_viewtasks(self, message: Dict):
+        """Show user's pending tasks for today."""
+        chat_id = message["chat"]["id"]
+        telegram_id = message.get("from", {}).get("id")
+
+        if not _supabase_enabled or not _supabase_client:
+            self.send_message(chat_id, "⚠️ Task system not available.")
+            return
+
+        try:
+            # Get user from database
+            user_result = _supabase_client.table('telegram_users') \
+                .select('id, name') \
+                .eq('telegram_id', telegram_id) \
+                .execute()
+
+            if not user_result.data:
+                self.send_message(chat_id, "❌ You're not registered in the system.")
+                return
+
+            user = user_result.data[0]
+            user_id = user['id']
+            user_name = user.get('name', 'User')
+
+            # Get today's date and current time
+            now = get_time_in_timezone(BUSINESS_TIMEZONE)
+            today = now.strftime('%Y-%m-%d')
+            current_time = now.strftime('%H:%M')
+
+            # Get today's tasks for this user
+            tasks_result = _supabase_client.table('task_assignments') \
+                .select('*, report_types(name)') \
+                .eq('assigned_to', user_id) \
+                .eq('scheduled_date', today) \
+                .in_('status', ['pending', 'in_progress']) \
+                .execute()
+
+            if not tasks_result.data:
+                self.send_message(chat_id, f"✅ No active tasks for today, {user_name}!")
+                return
+
+            # Filter by start_time and end_time
+            active_tasks = []
+            for task in tasks_result.data:
+                start = task.get('start_time') or '00:00'
+                end = task.get('end_time') or '23:59'
+                # Convert times for comparison (just HH:MM)
+                start_cmp = start[:5] if len(start) >= 5 else start
+                end_cmp = end[:5] if len(end) >= 5 else end
+                if start_cmp <= current_time <= end_cmp:
+                    active_tasks.append(task)
+
+            if not active_tasks:
+                self.send_message(chat_id, f"✅ No active tasks right now, {user_name}!")
+                return
+
+            # Format response
+            response = f"📋 <b>Your Tasks for Today</b>\n"
+            response += f"👤 {user_name}\n"
+            response += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            for i, task in enumerate(active_tasks, 1):
+                status_emoji = "🔵" if task['status'] == 'pending' else "🟡"
+
+                # Get task name
+                if task.get('report_types') and task['report_types'].get('name'):
+                    task_name = task['report_types']['name']
+                else:
+                    task_name = task.get('notes') or 'Task'
+
+                # Format due time
+                due = task.get('due_time')
+                if due:
+                    # Convert HH:MM:SS to 12-hour format
+                    due_parts = due.split(':')
+                    hour = int(due_parts[0])
+                    minute = due_parts[1] if len(due_parts) > 1 else '00'
+                    period = 'AM' if hour < 12 else 'PM'
+                    display_hour = hour % 12 or 12
+                    due_str = f"{display_hour}:{minute} {period}"
+                else:
+                    due_str = 'No due time'
+
+                response += f"{status_emoji} {i}. <b>{task_name}</b>\n"
+                response += f"   ⏱️ Due: {due_str}\n\n"
+
+            response += "Use the Happy Manager dashboard to update task status."
+
+            self.send_message(chat_id, response)
+
+        except Exception as e:
+            self.logger.error(f"/viewtasks failed: {e}", exc_info=True)
+            self.send_message(chat_id, "⚠️ Error fetching tasks. Please try again.")
+
     def _handle_adu(self, message: Dict):
         """ADU rates with visual grouping by location"""
         chat_id = message["chat"]["id"]
-        
+
         try:
             items = self.notion.get_all_items()
             
@@ -3743,13 +7390,50 @@ class TelegramBot:
             
             if success:
                 items_count = len([v for v in quantities.values() if v > 0])
-                entry_type = "on-hand count" if state.entry_type == "on_hand" else "delivery"
-                
+                entry_type_display = "on-hand count" if state.entry_type == "on_hand" else "delivery"
+
+                # === CONSUMPTION CYCLE TRIGGERS ===
+                try:
+                    if state.entry_type == 'received':
+                        # Delivery received - start new consumption cycles
+                        print(f"[ENTRY] Starting consumption cycles for received delivery")
+                        on_hand_data = self.notion.get_latest_inventory(state.location, 'on_hand')
+
+                        for item_name, received_qty in quantities.items():
+                            if received_qty and received_qty > 0:
+                                current_on_hand = float(on_hand_data.get(item_name, 0) or 0)
+                                # Start of new cycle = current on_hand + what we just received
+                                start_on_hand = current_on_hand + received_qty
+
+                                self.notion.start_consumption_cycle(
+                                    location=state.location,
+                                    item_name=item_name,
+                                    on_hand=start_on_hand,
+                                    received=received_qty
+                                )
+
+                    elif state.entry_type == 'on_hand':
+                        # On-hand count - close any open cycles
+                        print(f"[ENTRY] Checking consumption cycles for on_hand count")
+
+                        for item_name, on_hand_qty in quantities.items():
+                            if on_hand_qty is not None:
+                                # This will close any open cycles and trigger calibration check
+                                self.notion._close_open_cycles(
+                                    location=state.location,
+                                    item_name=item_name,
+                                    end_on_hand=float(on_hand_qty)
+                                )
+                except Exception as cycle_err:
+                    print(f"[ENTRY] ⚠ Cycle processing error (non-fatal): {cycle_err}")
+                    self.logger.warning(f"Cycle processing error: {cycle_err}")
+                # === END CONSUMPTION CYCLE TRIGGERS ===
+
                 self.send_message(state.chat_id,
                                 f"✅ <b>Entry Saved</b>\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                                 f"Saved {items_count} items for {state.location}\n"
-                                f"Type: {entry_type}\n"
+                                f"Type: {entry_type_display}\n"
                                 f"Date: {state.data['date']}\n\n"
                                 f"Use /info to see updated status")
             else:
@@ -4303,6 +7987,11 @@ class EntrySession:
     notes: str = ""
     image_file_id: Optional[str] = None
     current_step: str = "items"
+
+    # Tracking for entry confirmation stats
+    recount_count: int = 0  # How many times user chose to recount
+    variance_count: int = 0  # How many variance alerts were confirmed
+    variance_items: List[str] = field(default_factory=list)  # Items that had variance
     
     # Legacy field for backwards compatibility - both point to same value
     @property
@@ -4406,9 +8095,9 @@ class EnhancedEntryHandler:
             display_name = "Unknown"
         
         self.logger.debug(f"Extracted Telegram display name | name='{display_name}' user_id={user.get('id')}")
-        
+
         return display_name
-    
+
     def handle_entry_command(self, message: Dict):
         """
         Entry point for /entry command.
@@ -4519,16 +8208,16 @@ class EnhancedEntryHandler:
         """
         Handle location selection from dynamic menu.
         Location string comes directly from Notion Items Master via callback data.
-        
+
         Args:
             chat_id: Telegram chat ID
             user_id: Telegram user ID
             location: Location name as selected by user (from Notion)
-            
+
         Logs: location selected, session creation, mode prompt
         """
         self.logger.info(f"Location selected for entry | location='{location}' user={user_id}")
-        
+
         # Create session with dynamic location
         session = EntrySession(
             user_id=user_id,
@@ -4719,51 +8408,68 @@ class EnhancedEntryHandler:
         
         return hash_digest
     
-    def _build_entry_review_message(self, session: EntrySession, date: str, 
+    def _build_entry_review_message(self, session: EntrySession, date: str,
                                     submitter: str = "Unknown") -> str:
         """
-        Build minimal entry review message for prep chat posting.
-        
-        Format:
-        Submitter (if present)
-        Entry Type • Date
-        • qty × item lines
-        
+        Build detailed entry confirmation message for notifications.
+
+        Format matches the "Review Your Entry" screen:
+        - Type, Location, Submitter, Date
+        - All items with quantities and units
+        - Summary stats including recounts and variance alerts
+
         Args:
             session: Entry session
             date: Entry date
             submitter: Submitter name/handle
-            
+
         Returns:
             str: Formatted message
-            
+
         Logs: message build
         """
         entry_type_display = "On-Hand Count" if session.mode == "on_hand" else "Received Delivery"
-        
-        # Build message
-        text = ""
-        
-        # Submitter on first line if present
-        if submitter and submitter != "Unknown":
-            text += f"{submitter}\n"
-        
-        text += f"{entry_type_display} • {date}\n"
-        
-        # Items
+
+        # Header section
+        text = "📋 <b>Entry Confirmation</b>\n\n"
+        text += f"<b>Type:</b> {entry_type_display}\n"
+        text += f"<b>Location:</b> {session.location}\n"
+        text += f"<b>Submitter:</b> {submitter}\n"
+        text += f"<b>Date:</b> {date}\n\n"
+
+        # Items section - show ALL items (even with 0)
         entered_items = []
+        total_qty = 0.0
+        items_with_qty = 0
+
         for item in session.items:
             qty = session.answers.get(item['name'])
-            if qty is not None and qty > 0:
-                entered_items.append(f"• {qty} × {item['name']}")
-        
+            if qty is not None:
+                unit = item.get('unit', '')
+                unit_str = f" {unit}" if unit else ""
+                entered_items.append(f"• {item['name']}: {qty}{unit_str}")
+                total_qty += qty
+                if qty > 0:
+                    items_with_qty += 1
+
+        text += f"📦 <b>Entered ({len(entered_items)}):</b>\n"
         if entered_items:
             text += "\n".join(entered_items)
         else:
             text += "• No items recorded"
-        
-        self.logger.debug(f"Entry review message built | items={len(entered_items)} submitter={submitter}")
-        
+
+        # Summary section
+        text += "\n\n📊 <b>Summary:</b>\n"
+        text += f"• Items entered: {items_with_qty}/{len(session.items)}\n"
+        text += f"• Total quantity: {total_qty:.1f}\n"
+
+        # Show recount and variance stats if any occurred
+        if session.recount_count > 0 or session.variance_count > 0:
+            text += f"• Recounts: {session.recount_count}\n"
+            text += f"• Variance alerts: {session.variance_count}\n"
+
+        self.logger.debug(f"Entry review message built | items={len(entered_items)} submitter={submitter} recounts={session.recount_count} variances={session.variance_count}")
+
         return text
     
     def handle_callback(self, callback_query: Dict):
@@ -4812,6 +8518,38 @@ class EnhancedEntryHandler:
             if session and session.current_step == "image":
                 session.current_step = "review"
                 self._handle_done(chat_id, user_id)
+
+        # === PHASE 4: VARIANCE CALLBACKS ===
+        elif data == "entry_var_recount":
+            session = self.sessions.get(user_id)
+            if session and hasattr(session, 'pending_variance'):
+                # Clear pending, re-prompt same item
+                item_name = session.pending_variance.get('item_name', 'item')
+                session.pending_variance = {}
+                session.current_step = 'enter_items'
+                # Track recount
+                session.recount_count += 1
+                self.logger.info(f"[PHASE 4] User chose to recount {item_name} (total recounts: {session.recount_count})")
+                print(f"[PHASE 4] Recount requested for {item_name}")
+                self._show_current_item(session)
+
+        elif data == "entry_var_confirm":
+            session = self.sessions.get(user_id)
+            if session and hasattr(session, 'pending_variance'):
+                # Request photo
+                session.current_step = 'variance_photo'
+                item_name = session.pending_variance.get('item_name', 'item')
+                # Track variance confirmation
+                session.variance_count += 1
+                if item_name not in session.variance_items:
+                    session.variance_items.append(item_name)
+                self.logger.info(f"[PHASE 4] User confirming variance for {item_name} with photo (total variances: {session.variance_count})")
+                print(f"[PHASE 4] Photo confirmation requested for {item_name}")
+                print(f"[DEBUG] Set current_step to: {session.current_step} for user {user_id}")
+                self.bot.send_message(chat_id, f"📸 Send a photo of <b>{item_name}</b> inventory to confirm your count.")
+            else:
+                print(f"[DEBUG] entry_var_confirm: No session or no pending_variance for user {user_id}")
+        # === END PHASE 4: VARIANCE CALLBACKS ===
 
     def handle_text_input(self, message: Dict, session: EntrySession):
         """
@@ -4892,14 +8630,51 @@ class EnhancedEntryHandler:
                 self._show_current_item(session)
                 return
             
+            # === PHASE 4: VARIANCE CHECK ===
+            item = session.get_current_item()
+            if session.mode == 'on_hand' and item:
+                variance = self.notion.check_variance(item['name'], session.vendor, quantity)
+                self.logger.info(f"[PHASE 4] Variance check for {item['name']}: {variance}")
+
+                if variance['suspicious']:
+                    # Store pending, enter challenge mode
+                    if not hasattr(session, 'pending_variance'):
+                        session.pending_variance = {}
+                    session.pending_variance = {
+                        'qty': quantity,
+                        'item_name': item['name'],
+                        'variance': variance
+                    }
+                    session.current_step = 'variance_challenge'
+
+                    kb = {"inline_keyboard": [
+                        [{"text": "🔄 Recount", "callback_data": "entry_var_recount"}],
+                        [{"text": "✅ Confirm + Photo", "callback_data": "entry_var_confirm"}]
+                    ]}
+
+                    self.bot.send_message(
+                        chat_id,
+                        f"⚠️ <b>Variance Detected</b>\n\n"
+                        f"<b>{item['name']}</b>\n"
+                        f"You entered: {quantity}\n"
+                        f"Expected: ~{variance['expected']}\n"
+                        f"Variance: {variance['message']}\n"
+                        f"Threshold: {variance['threshold']:.0%}\n\n"
+                        f"Recount or confirm with photo?",
+                        reply_markup=kb
+                    )
+                    print(f"[PHASE 4] Variance challenge shown for {item['name']}")
+                    return
+            # === END PHASE 4: VARIANCE CHECK ===
+
             # Save quantity and move forward
             session.set_current_quantity(quantity)
             session.index += 1
-            
+
             # Log the entry
-            item = session.items[session.index - 1] if session.index > 0 else None
-            if item:
-                self.logger.info(f"Entry: {item['name']} = {quantity}")
+            logged_item = session.items[session.index - 1] if session.index > 0 else None
+            if logged_item:
+                self.logger.info(f"Entry: {logged_item['name']} = {quantity}")
             
             # Show next item or move to next step
             if session.index >= len(session.items):
@@ -5100,6 +8875,41 @@ class EnhancedEntryHandler:
             self._delete_session(user_id)
             return
         
+        # === PHASE 4: CHECK FOR FLAGGED ITEMS ===
+        flagged_items = getattr(session, 'flagged_items', {})
+        is_flagged = bool(flagged_items)
+        flag_reason = None
+
+        # === PHASE 3: COLLECT PHOTO URLS FROM FLAGGED ITEMS ===
+        photo_urls = []
+
+        if is_flagged:
+            flag_reason = f"Variance confirmed: {', '.join(flagged_items.keys())}"
+            self.logger.info(f"[PHASE 4] Entry has flagged items: {list(flagged_items.keys())}")
+            print(f"[PHASE 4] Saving flagged entry: {flag_reason}")
+
+            # Collect photo URLs from flagged items
+            for item_name, flag_data in flagged_items.items():
+                # Check for pre-stored photo_url first (Phase 3)
+                stored_url = flag_data.get('photo_url')
+                if stored_url:
+                    photo_urls.append(stored_url)
+                    self.logger.info(f"[PHASE 3] Collected stored photo URL for {item_name}")
+                else:
+                    # Fall back to getting URL from photo_id
+                    photo_id = flag_data.get('photo_id')
+                    if photo_id:
+                        bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+                        if bot_token:
+                            url = self.notion._get_telegram_photo_url(photo_id, bot_token)
+                            if url:
+                                photo_urls.append(url)
+                                self.logger.info(f"[PHASE 3] Collected photo URL for {item_name}")
+
+        # Use first photo URL for transaction (or None)
+        primary_photo_url = photo_urls[0] if photo_urls else None
+        # === END PHASE 3 ===
+
         # Save to Notion
         try:
             success = self.notion.save_inventory_transaction(
@@ -5109,15 +8919,35 @@ class EnhancedEntryHandler:
                 manager=submitter,
                 notes=session.notes if hasattr(session, 'notes') else "",
                 quantities=quantities,
-                image_file_id=session.image_file_id if hasattr(session, 'image_file_id') else None
+                image_file_id=session.image_file_id if hasattr(session, 'image_file_id') else None,
+                flagged=is_flagged,
+                flag_reason=flag_reason,
+                photo_url=primary_photo_url
             )
-            
+
             if not success:
                 self.logger.error(f"Failed to save entry to Notion | vendor={session.vendor}")
                 self.bot.send_message(chat_id, "⚠️ Failed to save to Notion. Please try again.")
                 return
-            
-            self.logger.info(f"Entry saved to Notion | vendor={session.vendor} items={len([q for q in quantities.values() if q > 0])}")
+
+            self.logger.info(f"Entry saved | vendor={session.vendor} items={len([q for q in quantities.values() if q > 0])}")
+
+            # === PHASE 4: SEND SUMMARY VARIANCE NOTIFICATIONS ===
+            if is_flagged:
+                for item_name, flag_data in flagged_items.items():
+                    try:
+                        self.bot.send_variance_notification(
+                            location=session.vendor,
+                            submitter=session.submitter_name,
+                            item_name=item_name,
+                            expected=flag_data.get('expected', 0),
+                            actual=flag_data.get('actual', 0),
+                            variance_pct=flag_data.get('variance', 0),
+                            photo_file_id=flag_data.get('photo_id')
+                        )
+                    except Exception as e:
+                        self.logger.error(f"[PHASE 4] Notification failed for {item_name}: {e}")
+            # === END PHASE 4 ===
             
         except Exception as e:
             self.logger.error(f"Exception saving entry to Notion | error={e}", exc_info=True)
@@ -5126,69 +8956,84 @@ class EnhancedEntryHandler:
         
         # Build review message for prep chat
         review_message = self._build_entry_review_message(session, date, submitter)
-        
-        # Resolve prep chat
-        prep_chat_id = self.bot._resolve_order_prep_chat(session.vendor, f"entry_{user_id}")
-        
-        if not prep_chat_id:
-            self.logger.warning(f"No prep chat configured for entry | vendor={session.vendor}")
-            # Still show success to user since Notion save worked
+
+        # Get notification config from database
+        session_token = f"entry_{user_id}"
+        notification_config = self.bot._get_notification_config(session.vendor, 'entry_confirmation', session_token)
+
+        # Resolve prep chat (group chat from DB or .env fallback)
+        prep_chat_id = self.bot._resolve_order_prep_chat(session.vendor, session_token)
+
+        # Track notification status
+        group_notified = False
+        individual_notified = 0
+
+        # Post to group chat if configured
+        if prep_chat_id:
+            try:
+                self.logger.info(f"Posting entry review to prep chat | chat_id={prep_chat_id} vendor={session.vendor}")
+                post_success = self.bot.send_message(prep_chat_id, review_message)
+
+                if post_success:
+                    group_notified = True
+                    self.logger.info(f"Entry review posted to group | chat={prep_chat_id}")
+                else:
+                    self.logger.error(f"Failed to post entry review | chat={prep_chat_id}")
+
+            except Exception as e:
+                self.logger.error(f"Exception posting entry review | error={e}", exc_info=True)
+
+        # Send to individual users from database config
+        if notification_config['found'] and notification_config['telegram_ids']:
+            individual_notified = self.bot._notify_individual_users(
+                notification_config['telegram_ids'],
+                review_message,
+                session_token
+            )
+
+        # Record hash to prevent duplicates if any notification succeeded
+        if group_notified or individual_notified > 0:
+            self.posted_entry_hashes[entry_hash] = datetime.now()
+            self.logger.info(f"Entry review posted | hash={entry_hash[:16]}... group={group_notified} individuals={individual_notified}")
+
+        # Success message to user
+        mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
+        items_count = len([q for q in quantities.values() if q > 0])
+
+        if group_notified or individual_notified > 0:
+            # Notifications sent successfully
+            notification_details = []
+            if group_notified:
+                notification_details.append("group chat")
+            if individual_notified > 0:
+                notification_details.append(f"{individual_notified} team member(s)")
+
             self.bot.send_message(
                 chat_id,
-                f"✅ <b>Entry Saved</b>\n"
-                f"────────────────────────────\n"
-                f"Saved to Notion for {session.vendor}\n"
-                f"Items: {len([q for q in quantities.values() if q > 0])}\n\n"
-                f"⚠️ Note: No prep chat configured for notifications"
+                f"✅ <b>Entry Saved & Posted</b>\n\n"
+                f"Saved {items_count} items for {session.vendor}\n"
+                f"Type: {mode_text}\n"
+                f"Date: {date}\n\n"
+                f"Notified: {', '.join(notification_details)}"
             )
-            self._delete_session(user_id)
-            return
-        
-        # Post to prep chat
-        try:
-            self.logger.info(f"Posting entry review to prep chat | chat_id={prep_chat_id} vendor={session.vendor}")
-            post_success = self.bot.send_message(prep_chat_id, review_message)
-            
-            if post_success:
-                # Record hash to prevent duplicates
-                self.posted_entry_hashes[entry_hash] = datetime.now()
-                self.logger.info(f"Entry review posted successfully | hash={entry_hash[:16]}... chat={prep_chat_id}")
-                
-                # Success message to user
-                mode_text = "on-hand count" if session.mode == "on_hand" else "delivery"
-                items_count = len([q for q in quantities.values() if q > 0])
-                
-                self.bot.send_message(
-                    chat_id,
-                    f"✅ <b>Entry Saved & Posted</b>\n"
-                    f"────────────────────────────\n"
-                    f"Saved {items_count} items for {session.vendor}\n"
-                    f"Type: {mode_text}\n"
-                    f"Date: {date}\n\n"
-                    f"Review posted to prep team"
-                )
-            else:
-                self.logger.error(f"Failed to post entry review | chat={prep_chat_id}")
-                # Still saved to Notion
-                self.bot.send_message(
-                    chat_id,
-                    f"✅ <b>Entry Saved</b>\n"
-                    f"────────────────────────────\n"
-                    f"Saved to Notion successfully\n\n"
-                    f"⚠️ Failed to post notification"
-                )
-                
-        except Exception as e:
-            self.logger.error(f"Exception posting entry review | error={e}", exc_info=True)
-            # Still saved to Notion
+        elif notification_config['found']:
+            # Config exists but notifications failed
             self.bot.send_message(
                 chat_id,
-                f"✅ <b>Entry Saved</b>\n"
-                f"────────────────────────────\n"
-                f"Saved to Notion successfully\n\n"
-                f"⚠️ Error posting notification"
+                f"✅ <b>Entry Saved</b>\n\n"
+                f"Saved successfully\n\n"
+                f"⚠️ Failed to send notifications"
             )
-        
+        else:
+            # No notification config at all
+            self.logger.warning(f"No notification config for entry | vendor={session.vendor}")
+            self.bot.send_message(
+                chat_id,
+                f"✅ <b>Entry Saved</b>\n\n"
+                f"Saved for {session.vendor}\n"
+                f"Items: {items_count}"
+            )
+
         # Clean up session
         self._delete_session(user_id)
 
@@ -5275,14 +9120,77 @@ class EnhancedEntryHandler:
 
     def handle_photo_input(self, message: Dict, session: EntrySession):
         """
-        Handle photo input for received deliveries.
-        
+        Handle photo input for received deliveries and variance confirmation.
+
         Args:
             message: Telegram message with photo
             session: Current entry session
         """
         chat_id = session.chat_id
-        
+
+        # === PHASE 4: VARIANCE PHOTO CONFIRMATION ===
+        if hasattr(session, 'current_step') and session.current_step == 'variance_photo':
+            photos = message.get('photo', [])
+            if not photos:
+                self.bot.send_message(chat_id, "Please send a photo to confirm.")
+                return
+
+            file_id = max(photos, key=lambda p: p.get('file_size', 0))['file_id']
+
+            # === PHASE 3: Get photo URL immediately for later use ===
+            bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+            photo_url = None
+            if bot_token:
+                photo_url = self.notion._get_telegram_photo_url(file_id, bot_token)
+                if photo_url:
+                    self.logger.info(f"[PHASE 3] Got photo URL for variance confirmation")
+            # === END PHASE 3 ===
+
+            # Accept the flagged count
+            pending = getattr(session, 'pending_variance', {})
+            item_name = pending.get('item_name', 'Unknown')
+            qty = pending.get('qty', 0)
+            variance = pending.get('variance', {})
+
+            # Set the quantity
+            session.set_current_quantity(qty)
+
+            # Track flagged items with photo URL (Phase 3)
+            if not hasattr(session, 'flagged_items'):
+                session.flagged_items = {}
+            session.flagged_items[item_name] = {
+                'expected': variance.get('expected'),
+                'actual': qty,
+                'variance': variance.get('variance'),
+                'photo_id': file_id,
+                'photo_url': photo_url
+            }
+
+            # Clear pending and advance
+            session.pending_variance = {}
+            session.index += 1
+            session.current_step = 'enter_items'
+
+            self.logger.info(f"[PHASE 4] Variance confirmed with photo | item={item_name} qty={qty}")
+            print(f"[PHASE 4] ✓ Variance confirmed: {item_name} = {qty} (flagged with photo)")
+
+            # Note: Variance notification with photo will be sent at submission (batched)
+            # Photo data is stored in session.flagged_items for later use
+
+            self.bot.send_message(chat_id, f"✓ <b>{item_name}</b>: {qty} <i>(flagged for review)</i>")
+
+            # Show next item or finish
+            if session.index >= len(session.items):
+                if session.mode == "received":
+                    session.current_step = "image"
+                    self._show_image_request(session)
+                else:
+                    self._handle_done(chat_id, session.user_id)
+            else:
+                self._show_current_item(session)
+            return
+        # === END PHASE 4: VARIANCE PHOTO ===
+
         try:
             # Get the largest photo (best quality) - same as communication bot
             photos = message.get('photo', [])
@@ -5332,6 +9240,1159 @@ class EnhancedEntryHandler:
             "You can also skip this step if no photo is available.",
             reply_markup=keyboard
         )
+
+# ===== REPORT HANDLER =====
+
+@dataclass
+class ReportSession:
+    """
+    Session state for interactive /reports flow.
+    Handles multi-step report submission via Telegram bot.
+    """
+    user_id: int
+    chat_id: int
+    report_id: Optional[str] = None
+    report_name: str = ""
+    is_global: bool = False
+    location: str = ""
+    questions: List[Dict[str, Any]] = field(default_factory=list)
+    question_index: int = 0
+    answers: Dict[str, Any] = field(default_factory=dict)
+    media_files: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    current_step: str = "select_report"  # select_report, select_location, questions, review
+    submitter_name: str = ""
+    started_at: datetime = field(default_factory=datetime.now)
+    expires_at: datetime = field(default_factory=lambda: datetime.now() + timedelta(hours=2))
+    last_message_id: Optional[int] = None
+
+    def is_expired(self) -> bool:
+        """Check if session has expired."""
+        return datetime.now() > self.expires_at
+
+    def update_activity(self):
+        """Reset expiration timer on activity."""
+        self.expires_at = datetime.now() + timedelta(hours=2)
+
+    def get_current_question(self) -> Optional[Dict[str, Any]]:
+        """Get current question being answered."""
+        if 0 <= self.question_index < len(self.questions):
+            return self.questions[self.question_index]
+        return None
+
+    def get_progress(self) -> str:
+        """Get progress string."""
+        return f"{self.question_index + 1}/{len(self.questions)}"
+
+    def move_back(self):
+        """Move to previous question."""
+        self.question_index = max(0, self.question_index - 1)
+
+    def move_forward(self):
+        """Move to next question."""
+        self.question_index += 1
+
+    def is_complete(self) -> bool:
+        """Check if all questions have been answered."""
+        return self.question_index >= len(self.questions)
+
+
+class ReportHandler:
+    """
+    Manages interactive /reports flow for submitting configurable reports.
+    Reports are defined in the dashboard and submitted via the bot.
+    """
+
+    def __init__(self, bot, notion_manager):
+        """Initialize with dependencies."""
+        self.bot = bot
+        self.notion = notion_manager
+        self.logger = logging.getLogger('reports')
+        self.sessions: Dict[int, ReportSession] = {}
+        self._temp_messages: Dict[int, Dict] = {}
+
+    def _get_supabase(self):
+        """Get Supabase client."""
+        global _supabase_client
+        return _supabase_client
+
+    def _create_keyboard(self, buttons: List[List[Tuple[str, str]]]) -> Dict:
+        """Create inline keyboard markup."""
+        return {
+            "inline_keyboard": [
+                [{"text": text, "callback_data": data} for text, data in row]
+                for row in buttons
+            ]
+        }
+
+    def _get_telegram_display_name(self, message: Dict) -> str:
+        """Extract display name from Telegram message."""
+        user = message.get("from", {})
+        first_name = user.get("first_name", "").strip()
+        last_name = user.get("last_name", "").strip()
+        username = user.get("username", "").strip()
+
+        if first_name or last_name:
+            return f"{first_name} {last_name}".strip()
+        elif username:
+            return f"@{username}"
+        return "Unknown"
+
+    def cleanup_expired_sessions(self):
+        """Remove expired sessions."""
+        expired = [uid for uid, s in self.sessions.items() if s.is_expired()]
+        for uid in expired:
+            del self.sessions[uid]
+            self.logger.info(f"Cleaned up expired report session | user={uid}")
+
+    def handle_reports_command(self, message: Dict):
+        """
+        Entry point for /reports command.
+        Shows available report types for submission.
+        """
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+
+        self.logger.info(f"/reports command | user={user_id}")
+
+        # Store message for display name extraction
+        self._temp_messages[user_id] = message
+
+        # Check for existing session
+        if user_id in self.sessions:
+            session = self.sessions[user_id]
+            if not session.is_expired():
+                keyboard = self._create_keyboard([
+                    [("📂 Resume", "report_resume"), ("🔄 Start Over", "report_new")],
+                    [("❌ Cancel", "report_cancel")]
+                ])
+                self.bot.send_message(
+                    chat_id,
+                    f"📋 <b>Active Report Session</b>\n"
+                    f"────────────────────────────\n"
+                    f"Report: {session.report_name}\n"
+                    f"Progress: {session.get_progress()}\n\n"
+                    f"What would you like to do?",
+                    reply_markup=keyboard
+                )
+                return
+
+        # Fetch available report types from Supabase
+        self._show_report_selection(chat_id, user_id)
+
+    def _show_report_selection(self, chat_id: int, user_id: int):
+        """Show available report types."""
+        supabase = self._get_supabase()
+        if not supabase:
+            self.bot.send_message(chat_id, "⚠️ Database connection unavailable. Please try again later.")
+            return
+
+        try:
+            # Get active report types
+            result = supabase.table('report_types').select('*').eq('active', True).order('sort_order').execute()
+            report_types = result.data if result.data else []
+
+            if not report_types:
+                self.bot.send_message(
+                    chat_id,
+                    "📋 <b>No Reports Available</b>\n"
+                    "────────────────────────────\n"
+                    "No report types have been configured yet.\n\n"
+                    "Reports can be created in the Admin Dashboard."
+                )
+                return
+
+            # Build report type buttons
+            buttons = []
+            for report in report_types:
+                icon = "📄" if report.get('is_global') else "📍"
+                name = report.get('name', 'Unnamed Report')
+                buttons.append([(f"{icon} {name}", f"report_select|{report['id']}")])
+
+            buttons.append([("❌ Cancel", "report_cancel")])
+
+            keyboard = self._create_keyboard(buttons)
+
+            self.bot.send_message(
+                chat_id,
+                "📋 <b>Submit a Report</b>\n"
+                "────────────────────────────\n"
+                "Select a report type:\n\n"
+                "📄 = Global report\n"
+                "📍 = Location-specific",
+                reply_markup=keyboard
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error fetching report types: {e}")
+            self.bot.send_message(chat_id, "⚠️ Error loading reports. Please try again.")
+
+    def _handle_report_selection(self, chat_id: int, user_id: int, report_id: str):
+        """Handle report type selection."""
+        supabase = self._get_supabase()
+        if not supabase:
+            self.bot.send_message(chat_id, "⚠️ Database connection unavailable.")
+            return
+
+        try:
+            # Get report type details
+            result = supabase.table('report_types').select('*').eq('id', report_id).single().execute()
+            report = result.data
+
+            if not report:
+                self.bot.send_message(chat_id, "⚠️ Report not found.")
+                return
+
+            # Get questions for this report
+            questions_result = supabase.table('report_questions').select('*').eq('report_type_id', report_id).order('sort_order').execute()
+            questions = questions_result.data if questions_result.data else []
+
+            # Extract submitter name
+            message = self._temp_messages.get(user_id, {})
+            submitter_name = self._get_telegram_display_name(message)
+
+            # Create session
+            session = ReportSession(
+                user_id=user_id,
+                chat_id=chat_id,
+                report_id=report_id,
+                report_name=report.get('name', 'Report'),
+                is_global=report.get('is_global', False),
+                questions=questions,
+                submitter_name=submitter_name
+            )
+
+            self.sessions[user_id] = session
+            self.logger.info(f"Report session created | report={report.get('name')} user={user_id}")
+
+            # If location-specific, prompt for location
+            if not session.is_global:
+                self._show_location_selection(chat_id, session)
+            else:
+                # Start questions directly
+                self._start_questions(chat_id, session)
+
+        except Exception as e:
+            self.logger.error(f"Error handling report selection: {e}")
+            self.bot.send_message(chat_id, "⚠️ Error loading report. Please try again.")
+
+    def _show_location_selection(self, chat_id: int, session: ReportSession):
+        """Show location selection for location-specific reports."""
+        try:
+            locations = self.notion.get_locations(use_cache=True)
+
+            if not locations:
+                self.bot.send_message(chat_id, "⚠️ No locations available.")
+                return
+
+            buttons = []
+            for location in locations:
+                buttons.append([(f"📍 {location}", f"report_loc|{location}")])
+            buttons.append([("❌ Cancel", "report_cancel")])
+
+            keyboard = self._create_keyboard(buttons)
+
+            self.bot.send_message(
+                chat_id,
+                f"📋 <b>{session.report_name}</b>\n"
+                "────────────────────────────\n"
+                "Select location:",
+                reply_markup=keyboard
+            )
+            session.current_step = "select_location"
+
+        except Exception as e:
+            self.logger.error(f"Error showing locations: {e}")
+            self.bot.send_message(chat_id, "⚠️ Error loading locations.")
+
+    def _handle_location_selection(self, chat_id: int, user_id: int, location: str):
+        """Handle location selection."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "Session expired. Use /reports to start over.")
+            return
+
+        session.location = location
+        session.update_activity()
+        self.logger.info(f"Location selected | location={location} user={user_id}")
+
+        self._start_questions(chat_id, session)
+
+    def _start_questions(self, chat_id: int, session: ReportSession):
+        """Begin the question flow."""
+        if not session.questions:
+            self.bot.send_message(
+                chat_id,
+                "📋 <b>No Questions</b>\n"
+                "────────────────────────────\n"
+                "This report has no questions configured.\n"
+                "Please contact your administrator."
+            )
+            del self.sessions[session.user_id]
+            return
+
+        session.current_step = "questions"
+        session.question_index = 0
+        self._show_current_question(chat_id, session)
+
+    def _show_current_question(self, chat_id: int, session: ReportSession):
+        """Display the current question."""
+        question = session.get_current_question()
+        if not question:
+            # All questions answered, move to review
+            self._show_review(chat_id, session)
+            return
+
+        session.update_activity()
+
+        q_text = question.get('question_text', 'Question')
+        q_type = question.get('question_type', 'text')
+        q_id = question.get('id')
+        help_text = question.get('help_text', '')
+        placeholder = question.get('placeholder', '')
+        is_required = question.get('is_required', True)
+
+        # Build question message
+        required_marker = "❗" if is_required else "⚪"
+        msg = f"📋 <b>{session.report_name}</b>\n"
+        msg += f"────────────────────────────\n"
+        msg += f"{required_marker} <b>Question {session.get_progress()}</b>\n\n"
+        msg += f"{q_text}\n"
+
+        if help_text:
+            msg += f"\n<i>{help_text}</i>\n"
+
+        # Add input instructions based on type
+        if q_type == 'text':
+            msg += f"\n💬 Type your answer"
+            if placeholder:
+                msg += f" (e.g., {placeholder})"
+        elif q_type == 'multiline':
+            msg += f"\n💬 Type your detailed answer"
+        elif q_type == 'number':
+            msg += f"\n🔢 Enter a number"
+            if placeholder:
+                msg += f" (e.g., {placeholder})"
+        elif q_type == 'boolean':
+            msg += f"\n👆 Select Yes or No"
+        elif q_type == 'select':
+            msg += f"\n👆 Select an option"
+        elif q_type in ['photo', 'photo_required']:
+            msg += f"\n📷 Send a photo"
+        elif q_type in ['video', 'video_required']:
+            msg += f"\n🎥 Send a video"
+
+        # Build navigation buttons based on question type
+        nav_buttons = []
+
+        if q_type == 'boolean':
+            nav_buttons.append([
+                ("✅ Yes", f"report_answer|{q_id}|yes"),
+                ("❌ No", f"report_answer|{q_id}|no")
+            ])
+        elif q_type == 'select':
+            options = question.get('options', [])
+            for opt in options[:4]:  # Limit to 4 options per row
+                nav_buttons.append([(f"▫️ {opt}", f"report_answer|{q_id}|{opt}")])
+
+        # Add navigation row
+        nav_row = []
+        if session.question_index > 0:
+            nav_row.append(("⬅️ Back", "report_back"))
+        if not is_required and q_type not in ['boolean', 'select']:
+            nav_row.append(("⏭️ Skip", "report_skip"))
+        nav_row.append(("❌ Cancel", "report_cancel"))
+
+        if nav_row:
+            nav_buttons.append(nav_row)
+
+        keyboard = self._create_keyboard(nav_buttons) if nav_buttons else None
+
+        self.bot.send_message(chat_id, msg, reply_markup=keyboard)
+
+    def _handle_text_answer(self, session: ReportSession, text: str):
+        """Process a text answer."""
+        question = session.get_current_question()
+        if not question:
+            return
+
+        q_id = question.get('id')
+        q_type = question.get('question_type', 'text')
+
+        # Validate based on type
+        if q_type == 'number':
+            try:
+                value = float(text.replace(',', ''))
+                session.answers[q_id] = value
+            except ValueError:
+                self.bot.send_message(
+                    session.chat_id,
+                    "⚠️ Please enter a valid number."
+                )
+                return
+        else:
+            session.answers[q_id] = text
+
+        session.move_forward()
+        self._show_current_question(session.chat_id, session)
+
+    def _handle_choice_answer(self, chat_id: int, user_id: int, q_id: str, value: str):
+        """Handle selection/boolean answer via callback."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "Session expired. Use /reports to start over.")
+            return
+
+        session.answers[q_id] = value
+        session.update_activity()
+        session.move_forward()
+        self._show_current_question(chat_id, session)
+
+    def handle_photo_input(self, message: Dict, session: ReportSession):
+        """Handle photo upload for photo questions."""
+        question = session.get_current_question()
+        if not question:
+            return
+
+        q_id = question.get('id')
+        q_type = question.get('question_type', '')
+
+        if q_type not in ['photo', 'photo_required']:
+            return
+
+        try:
+            photos = message.get("photo", [])
+            if photos:
+                # Get largest photo
+                photo = max(photos, key=lambda p: p.get("file_size", 0))
+                file_id = photo.get("file_id")
+
+                if q_id not in session.media_files:
+                    session.media_files[q_id] = []
+
+                session.media_files[q_id].append({
+                    'type': 'photo',
+                    'file_id': file_id
+                })
+                session.answers[q_id] = f"[Photo uploaded: {len(session.media_files[q_id])}]"
+
+                self.bot.send_message(
+                    session.chat_id,
+                    "✅ Photo received!"
+                )
+
+                session.move_forward()
+                self._show_current_question(session.chat_id, session)
+
+        except Exception as e:
+            self.logger.error(f"Error handling photo: {e}")
+            self.bot.send_message(session.chat_id, "⚠️ Error processing photo. Please try again.")
+
+    def handle_video_input(self, message: Dict, session: ReportSession):
+        """Handle video upload for video questions."""
+        question = session.get_current_question()
+        if not question:
+            return
+
+        q_id = question.get('id')
+        q_type = question.get('question_type', '')
+
+        if q_type not in ['video', 'video_required']:
+            return
+
+        try:
+            video = message.get("video", {})
+            if video:
+                file_id = video.get("file_id")
+
+                if q_id not in session.media_files:
+                    session.media_files[q_id] = []
+
+                session.media_files[q_id].append({
+                    'type': 'video',
+                    'file_id': file_id
+                })
+                session.answers[q_id] = f"[Video uploaded: {len(session.media_files[q_id])}]"
+
+                self.bot.send_message(
+                    session.chat_id,
+                    "✅ Video received!"
+                )
+
+                session.move_forward()
+                self._show_current_question(session.chat_id, session)
+
+        except Exception as e:
+            self.logger.error(f"Error handling video: {e}")
+            self.bot.send_message(session.chat_id, "⚠️ Error processing video. Please try again.")
+
+    def _show_review(self, chat_id: int, session: ReportSession):
+        """Show review screen before submission."""
+        session.current_step = "review"
+
+        msg = f"📋 <b>Review: {session.report_name}</b>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        if session.location:
+            msg += f"📍 Location: {session.location}\n"
+        msg += f"👤 Submitted by: {session.submitter_name}\n"
+        msg += "────────────────────────────\n\n"
+
+        # Show answers
+        for question in session.questions:
+            q_id = question.get('id')
+            q_text = question.get('question_text', 'Question')[:50]
+            answer = session.answers.get(q_id, 'Not answered')
+
+            # Truncate long answers for display
+            if isinstance(answer, str) and len(answer) > 50:
+                answer = answer[:47] + "..."
+
+            msg += f"<b>Q:</b> {q_text}\n"
+            msg += f"<b>A:</b> {answer}\n\n"
+
+        msg += "────────────────────────────\n"
+        msg += "✅ Submit this report?"
+
+        keyboard = self._create_keyboard([
+            [("✅ Submit", "report_submit"), ("✏️ Edit", "report_edit")],
+            [("❌ Cancel", "report_cancel")]
+        ])
+
+        self.bot.send_message(chat_id, msg, reply_markup=keyboard)
+
+    def _handle_submit(self, chat_id: int, user_id: int):
+        """Submit the completed report to Supabase."""
+        session = self.sessions.get(user_id)
+        if not session:
+            self.bot.send_message(chat_id, "Session expired. Use /reports to start over.")
+            return
+
+        supabase = self._get_supabase()
+        if not supabase:
+            self.bot.send_message(chat_id, "⚠️ Database connection unavailable.")
+            return
+
+        try:
+            # Prepare submission data
+            submission_data = {
+                'report_type_id': session.report_id,
+                'location': session.location or 'Global',
+                'submitted_by': session.submitter_name,
+                'telegram_user_id': user_id,
+                'submission_date': datetime.now().strftime('%Y-%m-%d'),
+                'answers': session.answers,
+                'status': 'submitted'
+            }
+
+            # Insert submission
+            result = supabase.table('report_submissions').insert(submission_data).execute()
+
+            if result.data:
+                submission_id = result.data[0]['id']
+
+                # Save media files if any
+                for q_id, media_list in session.media_files.items():
+                    for media in media_list:
+                        media_data = {
+                            'submission_id': submission_id,
+                            'question_id': q_id,
+                            'media_type': media.get('type', 'photo'),
+                            'telegram_file_id': media.get('file_id')
+                        }
+                        supabase.table('submission_media').insert(media_data).execute()
+
+                self.bot.send_message(
+                    chat_id,
+                    f"✅ <b>Report Submitted!</b>\n"
+                    f"────────────────────────────\n"
+                    f"📋 {session.report_name}\n"
+                    f"📍 {session.location or 'Global'}\n"
+                    f"👤 {session.submitter_name}\n\n"
+                    f"Your report has been saved and will be reviewed by management."
+                )
+
+                self.logger.info(f"Report submitted | report={session.report_name} user={user_id} submission_id={submission_id}")
+
+                # Clean up session
+                del self.sessions[user_id]
+            else:
+                raise Exception("No data returned from insert")
+
+        except Exception as e:
+            self.logger.error(f"Error submitting report: {e}")
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Error submitting report. Please try again or contact support."
+            )
+
+    def handle_text_input(self, message: Dict, session: ReportSession):
+        """Handle text input during question flow."""
+        if session.current_step != "questions":
+            return
+
+        text = message.get("text", "").strip()
+        if not text:
+            return
+
+        question = session.get_current_question()
+        if not question:
+            return
+
+        q_type = question.get('question_type', 'text')
+
+        # Only accept text for text-based questions
+        if q_type in ['text', 'multiline', 'number']:
+            self._handle_text_answer(session, text)
+
+    def handle_callback(self, callback_query: Dict):
+        """Handle all report-related callbacks."""
+        data = callback_query.get("data", "")
+        message = callback_query.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        user_id = callback_query.get("from", {}).get("id")
+
+        # Acknowledge callback
+        self.bot._make_request("answerCallbackQuery",
+                              {"callback_query_id": callback_query.get("id")})
+
+        self.logger.info(f"Report callback | data={data} user={user_id}")
+
+        # Route callbacks
+        if data.startswith("report_select|"):
+            report_id = data.split("|")[1]
+            self._handle_report_selection(chat_id, user_id, report_id)
+
+        elif data.startswith("report_loc|"):
+            location = data.split("|")[1]
+            self._handle_location_selection(chat_id, user_id, location)
+
+        elif data.startswith("report_answer|"):
+            parts = data.split("|")
+            if len(parts) >= 3:
+                q_id = parts[1]
+                value = parts[2]
+                self._handle_choice_answer(chat_id, user_id, q_id, value)
+
+        elif data == "report_resume":
+            session = self.sessions.get(user_id)
+            if session:
+                self._show_current_question(chat_id, session)
+
+        elif data == "report_new":
+            if user_id in self.sessions:
+                del self.sessions[user_id]
+            self._show_report_selection(chat_id, user_id)
+
+        elif data == "report_back":
+            session = self.sessions.get(user_id)
+            if session:
+                session.move_back()
+                self._show_current_question(chat_id, session)
+
+        elif data == "report_skip":
+            session = self.sessions.get(user_id)
+            if session:
+                question = session.get_current_question()
+                if question:
+                    session.answers[question.get('id')] = None
+                session.move_forward()
+                self._show_current_question(chat_id, session)
+
+        elif data == "report_edit":
+            session = self.sessions.get(user_id)
+            if session:
+                session.question_index = 0
+                session.current_step = "questions"
+                self._show_current_question(chat_id, session)
+
+        elif data == "report_submit":
+            self._handle_submit(chat_id, user_id)
+
+        elif data == "report_cancel":
+            if user_id in self.sessions:
+                del self.sessions[user_id]
+            self.bot.send_message(chat_id, "❌ Report cancelled.")
+
+
+# ===== SOP HANDLER =====
+
+@dataclass
+class SOPSession:
+    """Session state for interactive /sop flow."""
+    user_id: int
+    chat_id: int
+    template_id: Optional[str] = None
+    template_name: Optional[str] = None
+    template_description: Optional[str] = None
+    steps: List[Dict] = field(default_factory=list)
+    current_step_index: int = 0
+    completion_id: Optional[str] = None
+    responses: Dict[str, Dict] = field(default_factory=dict)
+    start_time: datetime = field(default_factory=datetime.now)
+    last_activity: datetime = field(default_factory=datetime.now)
+    timeout_minutes: int = 60
+
+    def update_activity(self):
+        self.last_activity = datetime.now()
+
+    def is_expired(self) -> bool:
+        return (datetime.now() - self.last_activity).total_seconds() > self.timeout_minutes * 60
+
+    def get_current_step(self) -> Optional[Dict]:
+        if 0 <= self.current_step_index < len(self.steps):
+            return self.steps[self.current_step_index]
+        return None
+
+    def get_progress(self) -> str:
+        return f"{self.current_step_index + 1}/{len(self.steps)}"
+
+
+class SOPHandler:
+    """
+    Manages interactive /sop flow for executing Standard Operating Procedures.
+    SOPs are defined in the dashboard and executed via the bot.
+    """
+
+    def __init__(self, bot, notion_manager):
+        """Initialize with dependencies."""
+        self.bot = bot
+        self.notion = notion_manager
+        self.logger = logging.getLogger('sop')
+        self.sessions: Dict[int, SOPSession] = {}
+
+    def _get_supabase(self):
+        """Get Supabase client."""
+        global _supabase_client
+        return _supabase_client
+
+    def _create_keyboard(self, buttons: List[List[Tuple[str, str]]]) -> Dict:
+        """Create inline keyboard markup."""
+        return {
+            "inline_keyboard": [
+                [{"text": text, "callback_data": data} for text, data in row]
+                for row in buttons
+            ]
+        }
+
+    def cleanup_expired_sessions(self):
+        """Remove expired sessions."""
+        expired = [uid for uid, s in self.sessions.items() if s.is_expired()]
+        for uid in expired:
+            del self.sessions[uid]
+            self.logger.info(f"Cleaned up expired SOP session | user={uid}")
+
+    def handle_sop_command(self, message: Dict):
+        """
+        Entry point for /sop command.
+        Shows available SOPs or starts a specific one.
+        """
+        chat_id = message["chat"]["id"]
+        user_id = message["from"]["id"]
+        text = message.get("text", "")
+
+        self.logger.info(f"/sop command | user={user_id}")
+
+        # Parse arguments
+        args = text.split()[1:] if len(text.split()) > 1 else []
+
+        if not args:
+            # List available SOPs
+            self._show_sop_selection(chat_id, user_id)
+        else:
+            # Start specific SOP
+            sop_name = '_'.join(args).lower()
+            self._start_sop_by_name(chat_id, user_id, sop_name)
+
+    def _show_sop_selection(self, chat_id: int, user_id: int):
+        """Show available SOPs."""
+        supabase = self._get_supabase()
+        if not supabase:
+            self.bot.send_message(chat_id, "⚠️ Database connection unavailable.")
+            return
+
+        try:
+            result = supabase.table('sop_templates').select('*').eq('active', True).order('sort_order').execute()
+            templates = result.data if result.data else []
+
+            if not templates:
+                self.bot.send_message(
+                    chat_id,
+                    "📋 <b>No SOPs Available</b>\n\n"
+                    "No Standard Operating Procedures have been configured yet.\n"
+                    "Contact your administrator to set up SOPs."
+                )
+                return
+
+            # Create keyboard with SOP buttons
+            buttons = []
+            for template in templates:
+                est_time = f" (~{template['estimated_minutes']}min)" if template.get('estimated_minutes') else ""
+                buttons.append([
+                    (f"📋 {template['name']}{est_time}", f"sop_start_{template['id']}")
+                ])
+
+            buttons.append([("❌ Cancel", "sop_cancel")])
+
+            keyboard = self._create_keyboard(buttons)
+            self.bot.send_message(
+                chat_id,
+                "📋 <b>Available SOPs</b>\n"
+                "────────────────────────────\n"
+                "Select an SOP to begin:\n",
+                reply_markup=keyboard
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error fetching SOPs | error={e}")
+            self.bot.send_message(chat_id, "⚠️ Error loading SOPs. Please try again.")
+
+    def _start_sop_by_name(self, chat_id: int, user_id: int, sop_name: str):
+        """Start an SOP by its normalized name."""
+        supabase = self._get_supabase()
+        if not supabase:
+            self.bot.send_message(chat_id, "⚠️ Database connection unavailable.")
+            return
+
+        try:
+            result = supabase.table('sop_templates').select('*').eq('name_normalized', sop_name).eq('active', True).single().execute()
+            template = result.data
+
+            if not template:
+                self.bot.send_message(chat_id, f"❌ SOP '{sop_name}' not found.\n\nUse /sop to see available SOPs.")
+                return
+
+            self._start_sop(chat_id, user_id, template['id'])
+
+        except Exception as e:
+            self.logger.error(f"Error starting SOP by name | name={sop_name} error={e}")
+            self.bot.send_message(chat_id, f"❌ SOP '{sop_name}' not found.\n\nUse /sop to see available SOPs.")
+
+    def _start_sop(self, chat_id: int, user_id: int, template_id: str):
+        """Start an SOP walkthrough."""
+        supabase = self._get_supabase()
+        if not supabase:
+            self.bot.send_message(chat_id, "⚠️ Database connection unavailable.")
+            return
+
+        try:
+            # Get template
+            template_result = supabase.table('sop_templates').select('*').eq('id', template_id).single().execute()
+            template = template_result.data
+
+            if not template:
+                self.bot.send_message(chat_id, "⚠️ SOP not found.")
+                return
+
+            # Get steps
+            steps_result = supabase.table('sop_steps').select('*').eq('sop_template_id', template_id).order('step_number').execute()
+            steps = steps_result.data if steps_result.data else []
+
+            if not steps:
+                self.bot.send_message(chat_id, "⚠️ This SOP has no steps configured.")
+                return
+
+            # Create completion record
+            completion = supabase.table('sop_completions').insert({
+                'sop_template_id': template_id,
+                'telegram_id': user_id,
+                'status': 'in_progress',
+                'step_responses': {},
+            }).execute()
+
+            completion_id = completion.data[0]['id'] if completion.data else None
+
+            # Create session
+            session = SOPSession(
+                user_id=user_id,
+                chat_id=chat_id,
+                template_id=template_id,
+                template_name=template['name'],
+                template_description=template.get('description'),
+                steps=steps,
+                current_step_index=0,
+                completion_id=completion_id,
+                responses={},
+                start_time=datetime.now(),
+            )
+            self.sessions[user_id] = session
+
+            # Send intro message
+            est_time = f"⏱ Est. time: {template['estimated_minutes']} min\n" if template.get('estimated_minutes') else ""
+            desc = f"\n{template['description']}\n" if template.get('description') else ""
+
+            self.bot.send_message(
+                chat_id,
+                f"📋 <b>Starting: {template['name']}</b>\n"
+                f"────────────────────────────{desc}\n"
+                f"📊 Steps: {len(steps)}\n"
+                f"{est_time}\n"
+                f"Let's begin!"
+            )
+
+            # Show first step
+            self._show_current_step(chat_id, user_id)
+
+        except Exception as e:
+            self.logger.error(f"Error starting SOP | template_id={template_id} error={e}")
+            self.bot.send_message(chat_id, "⚠️ Error starting SOP. Please try again.")
+
+    def _show_current_step(self, chat_id: int, user_id: int):
+        """Display the current step."""
+        session = self.sessions.get(user_id)
+        if not session:
+            return
+
+        step = session.get_current_step()
+        if not step:
+            self._complete_sop(chat_id, user_id)
+            return
+
+        text = f"<b>Step {step['step_number']}: {step['title']}</b>\n\n"
+        if step.get('instruction_text'):
+            text += f"{step['instruction_text']}\n\n"
+
+        # Handle media
+        if step.get('media_type') == 'image' and step.get('media_url'):
+            try:
+                self.bot._make_request("sendPhoto", {
+                    "chat_id": chat_id,
+                    "photo": step['media_url'],
+                    "caption": text[:1024],
+                    "parse_mode": "HTML"
+                })
+                # Continue to show buttons below the image
+                text = ""
+            except Exception as e:
+                self.logger.error(f"Error sending step image | error={e}")
+
+        # Build keyboard based on step type
+        buttons = []
+
+        # Branching question
+        if step.get('branch_condition'):
+            condition = step['branch_condition']
+            text += f"❓ {condition.get('question', 'Please confirm:')}"
+            buttons = [
+                [("✅ Yes", "sop_branch_yes"), ("❌ No", "sop_branch_no")]
+            ]
+        # Confirmation required
+        elif step.get('requires_confirmation'):
+            conf_type = step.get('confirmation_type', 'checkbox')
+            if conf_type == 'checkbox':
+                buttons = [[("✅ Done", "sop_confirm")]]
+            elif conf_type == 'photo':
+                text += "📸 Please send a photo to confirm this step."
+                buttons = [[("⏭ Skip", "sop_skip")]]
+            elif conf_type in ['text', 'number']:
+                text += f"✏️ Please enter your response ({conf_type})."
+                buttons = [[("⏭ Skip", "sop_skip")]]
+        else:
+            # No confirmation needed
+            buttons = [[("Next →", "sop_next")]]
+
+        # Add navigation
+        if session.current_step_index > 0:
+            buttons.append([("← Back", "sop_back"), ("❌ Cancel", "sop_cancel")])
+        else:
+            buttons.append([("❌ Cancel", "sop_cancel")])
+
+        keyboard = self._create_keyboard(buttons)
+
+        if text:  # Only send if there's text (might have sent image)
+            self.bot.send_message(chat_id, text, reply_markup=keyboard)
+        else:
+            # Just send buttons after image
+            self.bot.send_message(
+                chat_id,
+                f"Step {session.current_step_index + 1} of {len(session.steps)}",
+                reply_markup=keyboard
+            )
+
+    def _record_response(self, user_id: int, response: any, media_url: str = None):
+        """Record a step response."""
+        session = self.sessions.get(user_id)
+        if not session:
+            return
+
+        step = session.get_current_step()
+        if not step:
+            return
+
+        session.responses[step['id']] = {
+            'response': response,
+            'timestamp': datetime.now().isoformat(),
+        }
+        if media_url:
+            session.responses[step['id']]['media_url'] = media_url
+
+        session.update_activity()
+
+    def _advance_step(self, user_id: int, target_step: int = None):
+        """Move to the next step or a specific step."""
+        session = self.sessions.get(user_id)
+        if not session:
+            return
+
+        if target_step is not None:
+            # Go to specific step (1-indexed to 0-indexed)
+            session.current_step_index = target_step - 1
+        else:
+            session.current_step_index += 1
+
+        session.update_activity()
+
+    def _complete_sop(self, chat_id: int, user_id: int):
+        """Mark SOP as completed."""
+        session = self.sessions.get(user_id)
+        if not session:
+            return
+
+        end_time = datetime.now()
+        total_seconds = int((end_time - session.start_time).total_seconds())
+
+        supabase = self._get_supabase()
+        if supabase and session.completion_id:
+            try:
+                supabase.table('sop_completions').update({
+                    'status': 'completed',
+                    'completed_at': end_time.isoformat(),
+                    'step_responses': session.responses,
+                    'total_time_seconds': total_seconds,
+                }).eq('id', session.completion_id).execute()
+            except Exception as e:
+                self.logger.error(f"Error updating completion | error={e}")
+
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+
+        self.bot.send_message(
+            chat_id,
+            f"✅ <b>{session.template_name} Completed!</b>\n\n"
+            f"⏱ Time taken: {minutes} min {seconds} sec\n"
+            f"📊 Steps completed: {len(session.steps)}"
+        )
+
+        # Clean up session
+        del self.sessions[user_id]
+
+    def handle_text_input(self, message: Dict):
+        """Handle text/photo input for SOP steps requiring confirmation."""
+        user_id = message["from"]["id"]
+        chat_id = message["chat"]["id"]
+
+        session = self.sessions.get(user_id)
+        if not session:
+            return False
+
+        step = session.get_current_step()
+        if not step or not step.get('requires_confirmation'):
+            return False
+
+        conf_type = step.get('confirmation_type')
+
+        # Handle photo
+        if message.get('photo') and conf_type == 'photo':
+            photo = message['photo'][-1]  # Largest size
+            file_id = photo.get('file_id')
+            self._record_response(user_id, 'photo_submitted', media_url=file_id)
+            self._advance_step(user_id)
+            self._show_current_step(chat_id, user_id)
+            return True
+
+        # Handle text/number
+        if message.get('text') and conf_type in ['text', 'number']:
+            text = message['text']
+            if conf_type == 'number':
+                try:
+                    text = float(text)
+                except ValueError:
+                    self.bot.send_message(chat_id, "⚠️ Please enter a valid number.")
+                    return True
+            self._record_response(user_id, text)
+            self._advance_step(user_id)
+            self._show_current_step(chat_id, user_id)
+            return True
+
+        return False
+
+    def handle_callback(self, callback_query: Dict):
+        """Handle all SOP-related callbacks."""
+        data = callback_query.get("data", "")
+        message = callback_query.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        user_id = callback_query.get("from", {}).get("id")
+
+        # Acknowledge callback
+        self.bot._make_request("answerCallbackQuery",
+                              {"callback_query_id": callback_query.get("id")})
+
+        self.logger.debug(f"SOP callback | data={data} user={user_id}")
+
+        # Handle starting an SOP
+        if data.startswith("sop_start_"):
+            template_id = data.replace("sop_start_", "")
+            self._start_sop(chat_id, user_id, template_id)
+
+        elif data == "sop_next" or data == "sop_confirm":
+            session = self.sessions.get(user_id)
+            if session:
+                self._record_response(user_id, True)
+                self._advance_step(user_id)
+                self._show_current_step(chat_id, user_id)
+
+        elif data == "sop_skip":
+            session = self.sessions.get(user_id)
+            if session:
+                self._record_response(user_id, 'skipped')
+                self._advance_step(user_id)
+                self._show_current_step(chat_id, user_id)
+
+        elif data == "sop_back":
+            session = self.sessions.get(user_id)
+            if session and session.current_step_index > 0:
+                session.current_step_index -= 1
+                session.update_activity()
+                self._show_current_step(chat_id, user_id)
+
+        elif data == "sop_branch_yes":
+            session = self.sessions.get(user_id)
+            if session:
+                step = session.get_current_step()
+                self._record_response(user_id, 'yes')
+                if step and step.get('next_step_on_yes'):
+                    self._advance_step(user_id, step['next_step_on_yes'])
+                else:
+                    self._advance_step(user_id)
+                self._show_current_step(chat_id, user_id)
+
+        elif data == "sop_branch_no":
+            session = self.sessions.get(user_id)
+            if session:
+                step = session.get_current_step()
+                self._record_response(user_id, 'no')
+                if step and step.get('next_step_on_no'):
+                    self._advance_step(user_id, step['next_step_on_no'])
+                else:
+                    self._advance_step(user_id)
+                self._show_current_step(chat_id, user_id)
+
+        elif data == "sop_cancel":
+            session = self.sessions.get(user_id)
+            if session:
+                # Mark as abandoned
+                supabase = self._get_supabase()
+                if supabase and session.completion_id:
+                    try:
+                        supabase.table('sop_completions').update({
+                            'status': 'abandoned',
+                            'step_responses': session.responses,
+                        }).eq('id', session.completion_id).execute()
+                    except Exception as e:
+                        self.logger.error(f"Error updating abandoned SOP | error={e}")
+
+                del self.sessions[user_id]
+            self.bot.send_message(chat_id, "❌ SOP cancelled.")
+
 
 # ===== ORDER FLOW HANDLER =====
 
@@ -5860,32 +10921,120 @@ class OrderFlowHandler:
             self.logger.error(f"Error formatting date range | start={start_date} end={end_date} error={e}")
             return "Date Range"
     
-    def _compute_item_recommendation(self, adu: float, consumption_days: int, on_hand: float) -> int:
+    def _compute_item_recommendation(self, item: dict, on_hand: float, forecast_multiplier: float = 1.0) -> dict:
         """
-        Compute recommended order quantity.
-        
-        Formula: max(0, round(ADU * ConsumptionDays - OnHand))
-        
+        Compute order recommendation using PAR LEVELS with FORECAST ADJUSTMENT.
+
+        Logic:
+        - Adjusted min_par = min_par × forecast_multiplier
+        - Adjusted max_par = max_par × forecast_multiplier
+        - If on_hand < adjusted_min → ORDER (bring to adjusted_max)
+
         Args:
-            adu: Average daily usage
-            consumption_days: Days to cover
+            item: Item dict with 'name', 'min_par', 'max_par' keys
             on_hand: Current on-hand quantity
-            
+            forecast_multiplier: Sales forecast multiplier (default 1.0)
+
         Returns:
-            int: Recommended order quantity (whole number)
-            
-        Logs: all inputs and computed recommendation
+            dict with recommendation details including adjusted pars
+
+        Logs: All inputs, adjusted pars, decision logic
         """
         import math
-        
-        need = adu * consumption_days
-        recommended_raw = need - on_hand
-        recommended = max(0, math.ceil(recommended_raw))
-        
-        self.logger.debug(f"Item recommendation | adu={adu} days={consumption_days} on_hand={on_hand} need={need:.2f} rec={recommended}")
-        
-        return recommended
-    
+
+        item_name = item.get('name', item.get('item_name', 'Unknown'))
+        base_min_par = float(item.get('min_par', 0))
+        base_max_par = float(item.get('max_par', 0))
+
+        # Apply forecast adjustment
+        adj_min_par = base_min_par * forecast_multiplier
+        adj_max_par = base_max_par * forecast_multiplier
+
+        print(f"[PAR-CALC] '{item_name}': on_hand={on_hand:.1f}")
+        print(f"[PAR-CALC]   Base pars: min={base_min_par:.1f}, max={base_max_par:.1f}")
+        print(f"[PAR-CALC]   Forecast multiplier: {forecast_multiplier:.2f}")
+        print(f"[PAR-CALC]   Adjusted pars: min={adj_min_par:.1f}, max={adj_max_par:.1f}")
+
+        # Validate par configuration
+        if adj_max_par <= 0:
+            print(f"[PAR-CALC] ⚠ '{item_name}' has no max_par configured")
+            self.logger.warning(f"[PAR-CALC] Item '{item_name}' missing max_par")
+            return {
+                'item_name': item_name,
+                'on_hand': on_hand,
+                'min_par': base_min_par,
+                'max_par': base_max_par,
+                'adj_min_par': adj_min_par,
+                'adj_max_par': adj_max_par,
+                'forecast_multiplier': forecast_multiplier,
+                'order_qty': 0,
+                'status': 'UNCONFIGURED',
+                'reason': 'No max_par set'
+            }
+
+        # Par-based decision with adjusted values
+        if on_hand < adj_min_par:
+            order_qty = max(0, math.ceil(adj_max_par - on_hand))
+            status = 'ORDER'
+            reason = f'Below adjusted min ({on_hand:.1f} < {adj_min_par:.1f})'
+            print(f"[PAR-CALC] ✓ '{item_name}' → ORDER {order_qty}")
+        else:
+            order_qty = 0
+            status = 'OK'
+            reason = f'Above adjusted min ({on_hand:.1f} >= {adj_min_par:.1f})'
+            print(f"[PAR-CALC] ✓ '{item_name}' → OK")
+
+        self.logger.info(f"[PAR-CALC] {item_name}: {status} qty={order_qty} | mult={forecast_multiplier:.2f}")
+
+        return {
+            'item_name': item_name,
+            'on_hand': on_hand,
+            'min_par': base_min_par,
+            'max_par': base_max_par,
+            'adj_min_par': adj_min_par,
+            'adj_max_par': adj_max_par,
+            'forecast_multiplier': forecast_multiplier,
+            'order_qty': order_qty,
+            'status': status,
+            'reason': reason
+        }
+
+    # === PHASE 5: ORDER FLAGGING ===
+    def _check_order_flag(self, item: dict, quantity: float, recommended: float) -> dict:
+        """
+        Check if order quantity exceeds 130% of recommended.
+
+        Args:
+            item: Item dict with name, etc.
+            quantity: Ordered quantity
+            recommended: Recommended quantity
+
+        Returns:
+            dict: {'flagged': bool, 'ratio': float, 'message': str}
+        """
+        ORDER_FLAG_THRESHOLD = 1.30  # 130%
+
+        if recommended <= 0:
+            return {'flagged': False, 'ratio': 0, 'message': 'No recommendation'}
+
+        ratio = quantity / recommended
+        flagged = ratio > ORDER_FLAG_THRESHOLD
+
+        if flagged:
+            message = f"{ratio:.0%} of recommended ({recommended})"
+            self.logger.info(f"[PHASE 5] Order flagged: {item['name']} qty={quantity} rec={recommended} ratio={ratio:.0%}")
+            print(f"[PHASE 5] ORDER FLAG: {item['name']} - {quantity} is {ratio:.0%} of recommended {recommended}")
+        else:
+            message = "OK"
+
+        return {
+            'flagged': flagged,
+            'ratio': round(ratio, 2),
+            'message': message,
+            'threshold': ORDER_FLAG_THRESHOLD
+        }
+    # === END PHASE 5 ===
+
     def _handle_use_recommended(self, chat_id: int, user_id: int, item_name: str, rec_qty: str):
         """
         Handle "Use recommended" button click.
@@ -6209,7 +11358,46 @@ class OrderFlowHandler:
             self._handle_confirm(chat_id, user_id)
         elif data == "order_review_back":
             self._resume_items(chat_id, user_id)
-    
+
+        # === PHASE 5: ORDER FLAG CALLBACKS ===
+        elif data.startswith("order_flag_confirm|"):
+            parts = data.split("|")
+            item_name = parts[1]
+            quantity = float(parts[2])
+
+            if session and hasattr(session, 'pending_order_flag'):
+                pending = session.pending_order_flag
+
+                # Track flagged order items
+                if not hasattr(session, 'flagged_orders'):
+                    session.flagged_orders = {}
+
+                session.flagged_orders[item_name] = {
+                    'quantity': quantity,
+                    'recommended': pending.get('recommended'),
+                    'ratio': pending.get('ratio')
+                }
+
+                # Set quantity and continue
+                session.quantities[item_name] = quantity
+                session.pending_order_flag = {}
+
+                self.logger.info(f"[PHASE 5] Order flag confirmed: {item_name} = {quantity}")
+                self.bot.send_message(chat_id, f"<b>{item_name}</b>: {quantity} <i>(flagged)</i>")
+
+                # Move to next item
+                session.index += 1
+                if session.index >= len(session.items):
+                    self._handle_done(chat_id, user_id)
+                else:
+                    self._show_current_item(session)
+
+        elif data == "order_flag_change":
+            if session:
+                session.pending_order_flag = {}
+                self.bot.send_message(chat_id, "Enter a new quantity:")
+        # === END PHASE 5 ===
+
     def _handle_vendor_selection(self, chat_id: int, user_id: int, location: str):
         """
         Handle location selection from dynamic menu.
@@ -6281,7 +11469,7 @@ class OrderFlowHandler:
             self.logger.error(f"[{session.session_token}] Failed to load inventory | location='{session.location}' error={e}", exc_info=True)
             inventory_data = {}
         
-        # Build items list with On Hand and ADU
+        # Build items list with On Hand, ADU, and PAR levels
         items = []
         for item_obj in items_objs:
             on_hand = inventory_data.get(item_obj.name, 0.0)
@@ -6290,9 +11478,11 @@ class OrderFlowHandler:
                 'unit': item_obj.unit_type,
                 'adu': item_obj.adu,
                 'on_hand': on_hand,
-                'id': item_obj.id
+                'id': item_obj.id,
+                'min_par': getattr(item_obj, 'min_par', 0.0),
+                'max_par': getattr(item_obj, 'max_par', 0.0)
             })
-            self.logger.debug(f"[{session.session_token}] Item prepared | name={item_obj.name} on_hand={on_hand} adu={item_obj.adu}")
+            self.logger.debug(f"[{session.session_token}] [PAR] Item prepared | name={item_obj.name} on_hand={on_hand} min_par={getattr(item_obj, 'min_par', 0)} max_par={getattr(item_obj, 'max_par', 0)}")
         
         session.items = items
         
@@ -6382,47 +11572,84 @@ class OrderFlowHandler:
         else:
             range_label = "Not Set"
         
-        # Compute recommended quantity
-        recommended = self._compute_item_recommendation(item['adu'], consumption_days, item['on_hand'])
-        
-        self.logger.info(f"[{session.session_token}] Item computed | name={item['name']} days={consumption_days} range='{range_label}' rec={recommended}")
-        
-        # Build message text
+        # Get forecast multiplier for this vendor
+        forecast_multiplier = self.notion.get_forecast_multiplier(session.vendor)
+
+        # Compute recommended quantity using PAR logic with forecast
+        rec_result = self._compute_item_recommendation(item, item['on_hand'], forecast_multiplier)
+        recommended = rec_result['order_qty']
+        rec_status = rec_result['status']
+        rec_reason = rec_result['reason']
+
+        self.logger.info(f"[{session.session_token}] [PAR] Item computed | name={item['name']} status={rec_status} rec={recommended} mult={forecast_multiplier:.2f} | {rec_reason}")
+
+        # Get par values for display (use adjusted values if forecast active)
+        min_par = rec_result.get('adj_min_par', rec_result['min_par'])
+        max_par = rec_result.get('adj_max_par', rec_result['max_par'])
+
+        # Status indicator
+        if rec_status == 'ORDER':
+            status_icon = '🔴'
+            status_text = 'NEED TO ORDER'
+        elif rec_status == 'UNCONFIGURED':
+            status_icon = '⚠️'
+            status_text = 'PAR NOT SET'
+        else:
+            status_icon = '🟢'
+            status_text = 'OK'
+
+        # Build message text with PAR info
         text = (
             f"[{progress}] <b>{item['name']}</b>\n"
             f"Unit: {item['unit']}\n"
-            f"ADU: {item['adu']:.2f} /day\n"
-            f"On-Hand: {item['on_hand']:.1f}\n"
-            f"Consumption Days: {consumption_days} ({range_label})\n"
-            f"Recommended: {recommended}\n"
-            f"\n"
-            f"Enter order quantity:"
+            f"─────────────────────\n"
+            f"📦 On-hand: <b>{item['on_hand']:.1f}</b>\n"
+            f"📉 Min par: {min_par:.1f}\n"
+            f"📈 Max par: {max_par:.1f}\n"
         )
-        
+
+        # Show forecast info if multiplier != 1.0
+        if forecast_multiplier != 1.0:
+            text += f"📊 Forecast: ×{forecast_multiplier:.2f}\n"
+            text += f"   (pars adjusted for projected sales)\n"
+
+        text += (
+            f"─────────────────────\n"
+            f"{status_icon} Status: <b>{status_text}</b>\n"
+            f"💡 {rec_reason}\n"
+        )
+
+        if recommended > 0:
+            text += f"\n<b>Recommended: {recommended}</b>"
+
+        text += "\n\nEnter order quantity:"
+
         if current_value is not None:
             text += f"\n💡 Current order: {current_value}"
-        
+
+        print(f"[PAR-UI] Showing item '{item['name']}': status={rec_status}, rec={recommended}")
+
         # Create navigation buttons
         buttons = []
-        
-        # First row: Back (if not first) and Skip
-        first_row = []
-        if session.index > 0:
-            first_row.append(("◀️ Back", "order_back"))
-        first_row.append(("⏭️ Skip", "order_skip"))
-        buttons.append(first_row)
-        
-        # Second row: Use recommended button
+
+        # Recommendation button (if there's a recommendation)
         if recommended > 0:
-            buttons.append([("✅ Use recommended " + str(recommended), f"order_use_rec|{item['name']}|{recommended}")])
-        
-        # Third row: Done and Cancel
+            buttons.append([(f"✅ Use {recommended}", f"order_use_rec|{item['name']}|{recommended}")])
+
+        # Navigation row
+        nav_row = []
+        if session.index > 0:
+            nav_row.append(("◀️ Back", "order_back"))
+        nav_row.append(("⏭️ Skip", "order_skip"))
+        buttons.append(nav_row)
+
+        # Done/Cancel row
         buttons.append([("✅ Done", "order_done"), ("❌ Cancel", "order_cancel")])
-        
+
         keyboard = self._create_keyboard(buttons)
-        
+
         # Log message details
-        self.logger.debug(f"[{session.session_token}] Item prompt sent | item={item['name']} text_len={len(text)} buttons={len(buttons)}")
+        self.logger.debug(f"[{session.session_token}] [PAR-UI] Item prompt sent | item={item['name']} status={rec_status} rec={recommended}")
         
         self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
 
@@ -6553,14 +11780,59 @@ class OrderFlowHandler:
             qty = float(normalized)
             if qty < 0:
                 raise ValueError("Negative quantity")
-            
+
             item = session.get_current_item()
             item_name = item["name"] if item else "unknown"
             self.logger.info(f"[{session.session_token}] Valid quantity | qty={qty} item={item_name}")
 
+            # === PHASE 5: CHECK ORDER FLAG ===
+            if item and qty > 0:
+                # Get recommendation for this item
+                forecast_multiplier = self.notion.get_forecast_multiplier(session.vendor)
+                rec_result = self._compute_item_recommendation(item, item.get('on_hand', 0), forecast_multiplier)
+                recommended = rec_result.get('order_qty', 0)
+
+                # Check if flagged
+                flag_check = self._check_order_flag(item, qty, recommended)
+
+                if flag_check['flagged']:
+                    # Store pending flag for confirmation
+                    if not hasattr(session, 'pending_order_flag'):
+                        session.pending_order_flag = {}
+
+                    session.pending_order_flag = {
+                        'item_name': item['name'],
+                        'quantity': qty,
+                        'recommended': recommended,
+                        'ratio': flag_check['ratio']
+                    }
+
+                    # Show flag warning
+                    keyboard = self._create_keyboard([
+                        [("Confirm Order", f"order_flag_confirm|{item['name']}|{qty}")],
+                        [("Change Quantity", "order_flag_change")],
+                        [("Cancel", "order_cancel")]
+                    ])
+
+                    self.bot.send_message(
+                        chat_id,
+                        f"<b>ORDER FLAG</b>\n"
+                        f"{'=' * 25}\n\n"
+                        f"<b>{item['name']}</b>\n\n"
+                        f"You entered: <b>{qty}</b>\n"
+                        f"Recommended: <b>{recommended}</b>\n"
+                        f"Ratio: <b>{flag_check['ratio']:.0%}</b>\n\n"
+                        f"This order is significantly higher than recommended.\n"
+                        f"Managers will be notified.\n\n"
+                        f"Confirm or change quantity?",
+                        reply_markup=keyboard
+                    )
+                    return  # Don't proceed until confirmed
+            # === END PHASE 5 ===
+
             session.set_current_quantity(qty)
             session.index += 1
-            
+
             # Next step
             if session.index >= len(session.items):
                 self._handle_done(chat_id, session.user_id)
@@ -6641,10 +11913,37 @@ class OrderFlowHandler:
         """
         Display Review screen with current person tag (if any).
         Uses selected delivery date from calendar picker.
-        
+        Includes PAR coverage statistics.
+
         Logs: review display with tag, delivery date used.
         """
         self.logger.info(f"[{session.session_token}] Displaying Review with tag | tag='{session.person_tag}'")
+
+        # === PAR COVERAGE STATISTICS ===
+        print(f"[PAR-SUMMARY] Generating order summary for session {session.session_token}")
+
+        # Get forecast multiplier for this vendor
+        forecast_multiplier = self.notion.get_forecast_multiplier(session.vendor)
+        print(f"[PAR-SUMMARY] Using forecast multiplier: {forecast_multiplier:.2f}")
+
+        items_below_par = 0
+        items_ok = 0
+        items_unconfigured = 0
+
+        for item in session.items:
+            on_hand = item.get('on_hand', 0)
+            rec_result = self._compute_item_recommendation(item, on_hand, forecast_multiplier)
+
+            if rec_result['status'] == 'ORDER':
+                items_below_par += 1
+            elif rec_result['status'] == 'UNCONFIGURED':
+                items_unconfigured += 1
+            else:
+                items_ok += 1
+
+        print(f"[PAR-SUMMARY] Stats: {items_below_par} below par, {items_ok} ok, {items_unconfigured} unconfigured")
+        self.logger.info(f"[{session.session_token}] [PAR-SUMMARY] below_par={items_below_par}, ok={items_ok}, unconfigured={items_unconfigured}, mult={forecast_multiplier:.2f}")
+        # === END PAR STATISTICS ===
         
         # Use the delivery date selected in calendar picker
         delivery_date = session.delivery_date if session.delivery_date else "—"
@@ -6658,12 +11957,19 @@ class OrderFlowHandler:
             f"Vendor: <b>{session.vendor}</b>\n"
             f"Delivery: <b>{delivery_date}</b>\n"
         )
-        
+
         # Show consumption window if available
         if session.next_delivery_date and session.consumption_days:
             text += f"Next delivery: <b>{session.next_delivery_date}</b>\n"
             text += f"Coverage: <b>{session.consumption_days} days</b>\n"
-        
+
+        # Add PAR coverage stats
+        text += f"\n📊 <b>PAR Status:</b>\n"
+        text += f"  🔴 Below par: {items_below_par}\n"
+        text += f"  🟢 OK: {items_ok}\n"
+        if items_unconfigured > 0:
+            text += f"  ⚠️ Unconfigured: {items_unconfigured}\n"
+
         text += "\n"
         
         entered_items = []
@@ -6696,6 +12002,69 @@ class OrderFlowHandler:
         self.logger.info(f"[{session.session_token}] Review message built | delivery={delivery_date} items={len(entered_items)} text_len={len(text)}")
         
         self.bot.send_message(session.chat_id, text, reply_markup=keyboard)
+
+    def _build_order_review_message(self, session: OrderSession, delivery_date: str,
+                                    submitter: str = "Unknown") -> str:
+        """
+        Build detailed order confirmation message for notifications.
+
+        Format matches the Entry Confirmation format:
+        - Type, Location, Submitter, Delivery Date
+        - All items with quantities (including zeros)
+        - Summary stats
+
+        Args:
+            session: Order session
+            delivery_date: Delivery date
+            submitter: Submitter name
+
+        Returns:
+            str: Formatted message
+        """
+        # Header section
+        text = "📋 <b>Order Confirmation</b>\n\n"
+        text += f"<b>Type:</b> Order\n"
+        text += f"<b>Location:</b> {session.vendor}\n"
+        text += f"<b>Submitter:</b> {submitter}\n"
+        text += f"<b>Delivery Date:</b> {delivery_date}\n\n"
+
+        # Items section - show ALL items (including zeros for visibility)
+        ordered_items = []
+        total_qty = 0.0
+        items_with_qty = 0
+
+        for item in session.items:
+            qty = session.quantities.get(item['name'])
+            if qty is not None:
+                ordered_items.append(f"• {qty} × {item['name']}")
+                total_qty += qty
+                if qty > 0:
+                    items_with_qty += 1
+
+        text += f"📦 <b>Ordered ({items_with_qty}):</b>\n"
+        if ordered_items:
+            # Show items with qty first, then zeros
+            items_with_value = [i for i in ordered_items if not i.startswith("• 0 ×")]
+            items_zero = [i for i in ordered_items if i.startswith("• 0 ×")]
+            text += "\n".join(items_with_value)
+            if items_zero:
+                text += "\n\n<i>Not ordered:</i>\n"
+                text += "\n".join(items_zero)
+        else:
+            text += "• No items ordered"
+
+        # Summary section
+        text += "\n\n📊 <b>Summary:</b>\n"
+        text += f"• Items ordered: {items_with_qty}/{len(session.items)}\n"
+        text += f"• Total quantity: {total_qty:.0f}\n"
+
+        # Show person tag if set
+        if session.person_tag:
+            text += f"• Person: {session.person_tag}\n"
+
+        self.logger.debug(f"Order review message built | items={items_with_qty} submitter={submitter}")
+
+        return text
 
     def _handle_confirm(self, chat_id: int, user_id: int):
         """
@@ -6773,7 +12142,25 @@ class OrderFlowHandler:
         
         # Mark as confirmed
         session._confirmed = True
-        
+
+        # === PHASE 5: CHECK FOR FLAGGED ORDERS ===
+        flagged_orders = getattr(session, 'flagged_orders', {})
+        is_flagged = bool(flagged_orders)
+        flag_reason = None
+
+        if is_flagged:
+            flag_items = []
+            for item_name, flag_data in flagged_orders.items():
+                ratio = flag_data.get('ratio', 0)
+                flag_items.append(f"{item_name} ({ratio:.0%})")
+            flag_reason = f"Order exceeds recommendation: {', '.join(flag_items)}"
+
+            self.logger.info(f"[PHASE 5] Order has flagged items: {list(flagged_orders.keys())}")
+
+            # Send manager notification
+            self._notify_managers_order_flag(session, flagged_orders)
+        # === END PHASE 5 ===
+
         # Post to prep chat
         try:
             self.logger.info(f"[{session.session_token}] Posting to prep chat | chat_id={prep_chat_id}")
@@ -6783,13 +12170,45 @@ class OrderFlowHandler:
                 self.logger.info(f"[{session.session_token}] Order posted successfully | chat={prep_chat_id} items={len(entered_items)}")
                 self.bot.send_message(
                     chat_id,
-                    f"✅ <b>Order Posted</b>\n"
-                    f"────────────────────────────\n"
+                    f"✅ <b>Order Posted</b>\n\n"
                     f"Order sent to {session.vendor} prep team.\n"
                     f"Items: {len(entered_items)}\n"
                     f"Delivery: {delivery_date}"
                 )
-                
+
+                # Log order submission for deadline tracking
+                self.notion.log_deadline_event(
+                    location=session.vendor,
+                    event_type='order_submitted',
+                    submitted_by=session.submitter_name,
+                    notes=f"Order submitted via Telegram"
+                )
+                print(f"[ORDER] ✓ Logged order submission for deadline tracking")
+
+                # === ORDER NOTIFICATIONS (same as entry confirmations) ===
+                # Get notification config for this vendor
+                notification_config = self.bot._get_notification_config(
+                    session.vendor, 'entry_confirmation', session.session_token
+                )
+
+                # Build rich order review message for notifications
+                order_review_message = self._build_order_review_message(
+                    session, delivery_date, session.submitter_name or "Unknown"
+                )
+
+                # Send to individual users from database config
+                if notification_config['found'] and notification_config['telegram_ids']:
+                    notified_count = self.bot._notify_individual_users(
+                        notification_config['telegram_ids'],
+                        order_review_message,
+                        session.session_token
+                    )
+                    self.logger.info(f"[{session.session_token}] Order confirmation sent to {notified_count} user(s)")
+                    print(f"[ORDER] ✓ Sent order confirmation to {notified_count} user(s)")
+                else:
+                    self.logger.info(f"[{session.session_token}] No notification config for order confirmation | vendor={session.vendor}")
+                # === END ORDER NOTIFICATIONS ===
+
                 # Clean up session
                 self._delete_session(user_id)
             else:
@@ -6801,6 +12220,50 @@ class OrderFlowHandler:
             self.logger.error(f"[{session.session_token}] Exception posting to prep chat | chat={prep_chat_id} error={e}", exc_info=True)
             session._confirmed = False  # Allow retry
             self.bot.send_message(chat_id, "⚠️ Error posting order. Please try again or contact support.")
+
+    # === PHASE 5: MANAGER NOTIFICATION FOR FLAGGED ORDERS ===
+    def _notify_managers_order_flag(self, session: OrderSession, flagged_orders: dict):
+        """
+        Notify managers about flagged order items.
+
+        Args:
+            session: Current order session
+            flagged_orders: Dict of {item_name: {quantity, recommended, ratio}}
+        """
+        managers = self.notion.get_managers_for_location(session.vendor)
+
+        if not managers:
+            self.logger.warning(f"[PHASE 5] No managers found for {session.vendor}")
+            return
+
+        # Build message
+        items_text = ""
+        for item_name, data in flagged_orders.items():
+            qty = data.get('quantity', 0)
+            rec = data.get('recommended', 0)
+            ratio = data.get('ratio', 0)
+            items_text += f"  <b>{item_name}</b>\n"
+            items_text += f"    Ordered: {qty} | Recommended: {rec} | Ratio: {ratio:.0%}\n\n"
+
+        message = (
+            f"<b>ORDER FLAG ALERT</b>\n"
+            f"{'=' * 25}\n\n"
+            f"<b>Location:</b> {session.vendor}\n"
+            f"<b>Delivery Date:</b> {session.delivery_date}\n"
+            f"<b>Submitted by:</b> {session.submitter_name}\n\n"
+            f"<b>Flagged Items:</b>\n\n"
+            f"{items_text}"
+            f"<i>Orders exceed 130% of recommended quantities.</i>"
+        )
+
+        # Send to managers
+        for manager in managers:
+            try:
+                self.bot.send_message(manager['telegram_id'], message)
+                self.logger.info(f"[PHASE 5] Order flag notification sent to {manager['name']}")
+            except Exception as e:
+                self.logger.error(f"[PHASE 5] Failed to notify {manager['name']}: {e}")
+    # === END PHASE 5 ===
 
     def _handle_cancel(self, chat_id: int, user_id: int):
         """
@@ -6964,8 +12427,25 @@ class K2NotionInventorySystem:
             self.logger.info("Initializing Telegram bot...")
             bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
             self.bot = TelegramBot(bot_token, self.notion_manager, self.calculator)
-            
-            
+
+            # Initialize deadline checker
+            self.logger.info("Initializing deadline checker...")
+            self.deadline_checker = DeadlineChecker(self.notion_manager, self.bot)
+            self.deadline_checker.start()
+            print(f"[STARTUP] ✓ Deadline checker started")
+
+            # Initialize task assignment checker
+            self.logger.info("Initializing task assignment checker...")
+            self.task_checker = TaskAssignmentChecker(self.bot)
+            self.task_checker.start()
+            print(f"[STARTUP] ✓ Task assignment checker started")
+
+            # Initialize scheduled message sender
+            self.logger.info("Initializing scheduled message sender...")
+            self.scheduled_sender = ScheduledMessageSender(self.bot)
+            self.scheduled_sender.start()
+            print(f"[STARTUP] ✓ Scheduled message sender started")
+
             self.running = True
             self.logger.critical("System startup completed successfully")
             
@@ -6998,7 +12478,19 @@ class K2NotionInventorySystem:
         # if self.scheduler:
         #     self.logger.info("Stopping scheduler...")
         #     self.scheduler.stop()
-        
+
+        if hasattr(self, 'deadline_checker') and self.deadline_checker:
+            self.logger.info("Stopping deadline checker...")
+            self.deadline_checker.stop()
+
+        if hasattr(self, 'task_checker') and self.task_checker:
+            self.logger.info("Stopping task assignment checker...")
+            self.task_checker.stop()
+
+        if hasattr(self, 'scheduled_sender') and self.scheduled_sender:
+            self.logger.info("Stopping scheduled message sender...")
+            self.scheduled_sender.stop()
+
         if self.bot:
             self.logger.info("Stopping Telegram bot...")
             self.bot.stop()
